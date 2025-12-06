@@ -6,8 +6,11 @@ const c = @import("../platform/c.zig");
 const skylight = @import("../platform/skylight.zig");
 const Server = @import("Server.zig");
 const Response = @import("Response.zig");
+const Json = @import("Json.zig");
 const Display = @import("../core/Display.zig");
 const Displays = @import("../state/Displays.zig");
+const Windows = @import("../state/Windows.zig");
+const Spaces = @import("../state/Spaces.zig");
 
 /// Context needed for query operations
 pub const Context = struct {
@@ -15,75 +18,80 @@ pub const Context = struct {
     skylight: *const skylight.SkyLight,
     connection: c_int,
     displays: *Displays,
+    windows: *Windows,
+    spaces: *Spaces,
 };
+
+/// Send a JSON error response
+fn sendJsonError(client_fd: std.posix.socket_t, code: []const u8, message: []const u8) void {
+    var buf: [512]u8 = undefined;
+    var w = Json.Writer.init(&buf);
+
+    const err = Json.ErrorInfo{ .code = code, .message = message };
+    err.write(&w) catch return;
+    w.newline() catch return;
+
+    Server.sendFailure(client_fd, w.getWritten());
+}
 
 /// Query displays and return JSON
 pub fn queryDisplays(ctx: Context, client_fd: std.posix.socket_t) void {
-    var buf: [8192]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var buf: [16384]u8 = undefined;
+    var w = Json.Writer.init(&buf);
 
     // Get all displays
     const displays = Displays.getActiveDisplayList(ctx.allocator) catch {
-        Server.sendErr(client_fd, Response.err(.display_not_found));
+        sendJsonError(client_fd, "display_not_found", "no displays found");
         return;
     };
     defer ctx.allocator.free(displays);
 
-    writer.writeByte('[') catch return;
+    const main_display = Displays.getMainDisplayId();
+
+    w.beginArray() catch return;
 
     for (displays, 0..) |did, i| {
-        if (i > 0) writer.writeByte(',') catch return;
+        if (i > 0) w.comma() catch return;
 
         const bounds = Display.getBounds(did);
-        const is_main = (did == Displays.getMainDisplayId());
         const label = ctx.displays.getLabelForDisplay(did) orelse "";
-
-        // Get spaces for display
         const spaces = Display.getSpaceList(ctx.allocator, did) catch &[_]u64{};
         defer if (spaces.len > 0) ctx.allocator.free(spaces);
 
-        writer.print(
-            \\{{"id":{d},"uuid":"","index":{d},"label":"{s}","frame":{{"x":{d:.4},"y":{d:.4},"w":{d:.4},"h":{d:.4}}},"spaces":[
-        , .{
-            did,
-            i + 1,
-            label,
-            bounds.x,
-            bounds.y,
-            bounds.width,
-            bounds.height,
-        }) catch return;
-
-        for (spaces, 0..) |sid, j| {
-            if (j > 0) writer.writeByte(',') catch return;
-            writer.print("{d}", .{sid}) catch return;
-        }
-
-        writer.print("]," ++
-            \\"has-focus":{s}}}
-        , .{if (is_main) "true" else "false"}) catch return;
+        const info = Json.DisplayInfo{
+            .id = did,
+            .index = @intCast(i + 1),
+            .label = label,
+            .frame = .{
+                .x = bounds.x,
+                .y = bounds.y,
+                .w = bounds.width,
+                .h = bounds.height,
+            },
+            .spaces = spaces,
+            .has_focus = (did == main_display),
+        };
+        info.write(&w) catch return;
     }
 
-    writer.writeByte(']') catch return;
-    writer.writeByte('\n') catch return;
+    w.endArray() catch return;
+    w.newline() catch return;
 
-    Server.sendResponse(client_fd, fbs.getWritten());
+    Server.sendResponse(client_fd, w.getWritten());
 }
 
 /// Query spaces and return JSON
 pub fn querySpaces(ctx: Context, client_fd: std.posix.socket_t) void {
     var buf: [16384]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var w = Json.Writer.init(&buf);
 
     const displays = Displays.getActiveDisplayList(ctx.allocator) catch {
-        Server.sendErr(client_fd, Response.err(.display_not_found));
+        sendJsonError(client_fd, "display_not_found", "no displays found");
         return;
     };
     defer ctx.allocator.free(displays);
 
-    writer.writeByte('[') catch return;
+    w.beginArray() catch return;
     var first = true;
 
     for (displays, 0..) |did, display_idx| {
@@ -91,43 +99,45 @@ pub fn querySpaces(ctx: Context, client_fd: std.posix.socket_t) void {
         defer if (spaces.len > 0) ctx.allocator.free(spaces);
 
         const current_space = Display.getCurrentSpace(did);
+        const label = ctx.displays.getLabelForDisplay(did) orelse "";
+        _ = label;
 
         for (spaces, 0..) |sid, space_idx| {
-            if (!first) writer.writeByte(',') catch return;
+            if (!first) w.comma() catch return;
             first = false;
 
             const is_visible = if (current_space) |cs| cs == sid else false;
+            const space_label = ctx.spaces.getLabelForSpace(sid) orelse "";
 
-            writer.print(
-                \\{{"id":{d},"uuid":"","index":{d},"label":"","type":"user","display":{d},"windows":[],"first-window":0,"last-window":0,"has-focus":{s},"is-visible":{s},"is-native-fullscreen":false}}
-            , .{
-                sid,
-                space_idx + 1,
-                display_idx + 1,
-                if (is_visible) "true" else "false",
-                if (is_visible) "true" else "false",
-            }) catch return;
+            const info = Json.SpaceInfo{
+                .id = sid,
+                .index = @intCast(space_idx + 1),
+                .label = space_label,
+                .display = @intCast(display_idx + 1),
+                .has_focus = is_visible,
+                .is_visible = is_visible,
+            };
+            info.write(&w) catch return;
         }
     }
 
-    writer.writeByte(']') catch return;
-    writer.writeByte('\n') catch return;
+    w.endArray() catch return;
+    w.newline() catch return;
 
-    Server.sendResponse(client_fd, fbs.getWritten());
+    Server.sendResponse(client_fd, w.getWritten());
 }
 
 /// Query windows and return JSON
 pub fn queryWindows(ctx: Context, client_fd: std.posix.socket_t) void {
     var buf: [65536]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var w = Json.Writer.init(&buf);
 
     const sl = ctx.skylight;
     const cid = ctx.connection;
 
     // Get all displays and their spaces
     const displays = Displays.getActiveDisplayList(ctx.allocator) catch {
-        Server.sendErr(client_fd, Response.err(.display_not_found));
+        sendJsonError(client_fd, "display_not_found", "no displays found");
         return;
     };
     defer ctx.allocator.free(displays);
@@ -200,14 +210,12 @@ pub fn queryWindows(ctx: Context, client_fd: std.posix.socket_t) void {
     }
     defer c.c.CFRelease(iterator);
 
-    writer.writeByte('[') catch return;
+    w.beginArray() catch return;
     var first = true;
 
     while (sl.SLSWindowIteratorAdvance(iterator)) {
         const wid = sl.SLSWindowIteratorGetWindowID(iterator);
         const level = sl.SLSWindowIteratorGetLevel(iterator);
-        const tags = sl.SLSWindowIteratorGetTags(iterator);
-        _ = tags;
 
         // Get window bounds
         var bounds: c.CGRect = undefined;
@@ -229,28 +237,29 @@ pub fn queryWindows(ctx: Context, client_fd: std.posix.socket_t) void {
         const name_len = c.c.proc_name(pid, &proc_name, 256);
         const app_name = if (name_len > 0) proc_name[0..@intCast(name_len)] else "";
 
-        if (!first) writer.writeByte(',') catch return;
+        if (!first) w.comma() catch return;
         first = false;
 
-        writer.print(
-            \\{{"id":{d},"pid":{d},"app":"{s}","title":"","frame":{{"x":{d:.4},"y":{d:.4},"w":{d:.4},"h":{d:.4}}},"level":{d},"opacity":{d:.4},"is-visible":true}}
-        , .{
-            wid,
-            pid,
-            app_name,
-            bounds.origin.x,
-            bounds.origin.y,
-            bounds.size.width,
-            bounds.size.height,
-            level,
-            alpha,
-        }) catch return;
+        const info = Json.WindowInfo{
+            .id = wid,
+            .pid = pid,
+            .app = app_name,
+            .frame = .{
+                .x = bounds.origin.x,
+                .y = bounds.origin.y,
+                .w = bounds.size.width,
+                .h = bounds.size.height,
+            },
+            .level = level,
+            .opacity = alpha,
+        };
+        info.write(&w) catch return;
     }
 
-    writer.writeByte(']') catch return;
-    writer.writeByte('\n') catch return;
+    w.endArray() catch return;
+    w.newline() catch return;
 
-    Server.sendResponse(client_fd, fbs.getWritten());
+    Server.sendResponse(client_fd, w.getWritten());
 }
 
 /// Route query command to appropriate handler

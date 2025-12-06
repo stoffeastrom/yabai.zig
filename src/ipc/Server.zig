@@ -207,6 +207,15 @@ pub fn sendErr(client_fd: posix.socket_t, err: Response.Error) void {
     sendResponse(client_fd, buf[0 .. msg.len + 1]);
 }
 
+/// Send a failure response with raw message (used for JSON errors)
+pub fn sendFailure(client_fd: posix.socket_t, message: []const u8) void {
+    var buf: [MAX_MESSAGE_LEN]u8 = undefined;
+    buf[0] = 0x07; // FAILURE_MESSAGE
+    const copy_len = @min(message.len, buf.len - 1);
+    @memcpy(buf[1..][0..copy_len], message[0..copy_len]);
+    sendResponse(client_fd, buf[0 .. copy_len + 1]);
+}
+
 /// Get the socket path
 pub fn getSocketPath(self: *const Server) []const u8 {
     return self.socket_path[0..self.socket_path_len];

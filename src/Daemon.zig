@@ -887,6 +887,8 @@ pub const Daemon = struct {
             .skylight = self.skylight,
             .connection = self.connection,
             .displays = &self.displays,
+            .windows = &self.windows,
+            .spaces = &self.spaces,
         }, client_fd, args);
     }
 
