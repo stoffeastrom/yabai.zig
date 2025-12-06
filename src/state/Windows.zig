@@ -93,9 +93,27 @@ pub fn setFocused(self: *Windows, wid: ?Window.Id) void {
 
 /// Set minimized flag for a window
 pub fn setMinimized(self: *Windows, wid: Window.Id, minimized: bool) void {
-    if (self._table.get(wid)) |entry| {
-        entry.flags.minimized = minimized;
-    }
+    self._table.setMinimized(wid, minimized);
+}
+
+/// Set hidden flag for a window
+pub fn setHidden(self: *Windows, wid: Window.Id, hidden: bool) void {
+    self._table.setHidden(wid, hidden);
+}
+
+/// Set floating flag for a window
+pub fn setFloating(self: *Windows, wid: Window.Id, floating: bool) void {
+    self._table.setFloating(wid, floating);
+}
+
+/// Set sticky flag for a window
+pub fn setSticky(self: *Windows, wid: Window.Id, sticky: bool) void {
+    self._table.setSticky(wid, sticky);
+}
+
+/// Set shadow flag for a window
+pub fn setShadow(self: *Windows, wid: Window.Id, shadow: bool) void {
+    self._table.setShadow(wid, shadow);
 }
 
 /// Remove all windows for a given PID (returns count removed)
@@ -121,8 +139,8 @@ pub fn removeWindowsForPid(self: *Windows, pid: std.posix.pid_t) usize {
 // Window queries
 // ============================================================================
 
-/// Get a tracked window by ID
-pub fn getWindow(self: *Windows, wid: Window.Id) ?*TrackedWindow {
+/// Get a tracked window by ID (read-only copy)
+pub fn getWindow(self: *const Windows, wid: Window.Id) ?TrackedWindow {
     return self._table.get(wid);
 }
 
@@ -132,8 +150,8 @@ pub fn getWindowSpace(self: *Windows, wid: Window.Id) ?Space.Id {
     return if (entry.space_id != 0) entry.space_id else null;
 }
 
-/// Get the currently focused window
-pub fn getFocused(self: *Windows) ?*TrackedWindow {
+/// Get the currently focused window (read-only copy)
+pub fn getFocused(self: *const Windows) ?TrackedWindow {
     return self._table.getFocused();
 }
 

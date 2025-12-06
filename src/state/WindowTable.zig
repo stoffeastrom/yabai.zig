@@ -186,18 +186,55 @@ pub fn setFocused(self: *WindowTable, wid: ?Window.Id) void {
     self.focused_window_id = wid;
 }
 
+/// Set minimized flag for a window
+pub fn setMinimized(self: *WindowTable, wid: Window.Id, minimized: bool) void {
+    if (self.getPtr(wid)) |entry| {
+        entry.flags.minimized = minimized;
+    }
+}
+
+/// Set hidden flag for a window
+pub fn setHidden(self: *WindowTable, wid: Window.Id, hidden: bool) void {
+    if (self.getPtr(wid)) |entry| {
+        entry.flags.hidden = hidden;
+    }
+}
+
+/// Set floating flag for a window
+pub fn setFloating(self: *WindowTable, wid: Window.Id, floating: bool) void {
+    if (self.getPtr(wid)) |entry| {
+        entry.flags.floating = floating;
+    }
+}
+
+/// Set sticky flag for a window
+pub fn setSticky(self: *WindowTable, wid: Window.Id, sticky: bool) void {
+    if (self.getPtr(wid)) |entry| {
+        entry.flags.sticky = sticky;
+    }
+}
+
+/// Set shadow flag for a window
+pub fn setShadow(self: *WindowTable, wid: Window.Id, shadow: bool) void {
+    if (self.getPtr(wid)) |entry| {
+        entry.flags.shadow = shadow;
+    }
+}
+
 // ============================================================================
 // Queries
 // ============================================================================
 
-/// Get a window entry by ID
-pub fn get(self: *WindowTable, wid: Window.Id) ?*Entry {
-    return self.entries.getPtr(wid);
+/// Get a window entry by ID (read-only to prevent direct field mutation)
+/// Use mutation methods like moveToSpace(), setFlags() for changes
+pub fn get(self: *const WindowTable, wid: Window.Id) ?Entry {
+    return self.entries.get(wid);
 }
 
-/// Get a window entry by ID (const)
-pub fn getConst(self: *const WindowTable, wid: Window.Id) ?Entry {
-    return self.entries.get(wid);
+/// Get mutable pointer - INTERNAL USE ONLY for flag updates
+/// Space changes MUST go through moveToSpace() to maintain indexes
+fn getPtr(self: *WindowTable, wid: Window.Id) ?*Entry {
+    return self.entries.getPtr(wid);
 }
 
 /// Check if a window exists
@@ -221,8 +258,8 @@ pub fn getWindowsForPid(self: *const WindowTable, pid: std.posix.pid_t) []const 
     return &[_]Window.Id{};
 }
 
-/// Get the focused window entry
-pub fn getFocused(self: *WindowTable) ?*Entry {
+/// Get the focused window entry (read-only)
+pub fn getFocused(self: *const WindowTable) ?Entry {
     const wid = self.focused_window_id orelse return null;
     return self.get(wid);
 }

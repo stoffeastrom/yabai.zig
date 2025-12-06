@@ -269,6 +269,7 @@ pub fn getDisplayUUID(wid: Id) ?c.CFStringRef {
 }
 
 /// Get space ID for window (returns first space if on multiple)
+/// Falls back to display's current space if window-space query returns stale data
 pub fn getSpace(wid: Id) u64 {
     const sl = skylight.get() catch return 0;
     const cid = sl.SLSMainConnectionID();
@@ -276,23 +277,91 @@ pub fn getSpace(wid: Id) u64 {
     // Create array with single window ID
     var wid_val = wid;
     const wid_num = c.c.CFNumberCreate(null, c.c.kCFNumberSInt32Type, &wid_val);
-    if (wid_num == null) return 0;
+    if (wid_num == null) return getDisplaySpace(wid);
     defer c.c.CFRelease(wid_num);
 
     const wid_arr = c.c.CFArrayCreate(null, @ptrCast(@constCast(&wid_num)), 1, &c.c.kCFTypeArrayCallBacks);
-    if (wid_arr == null) return 0;
+    if (wid_arr == null) return getDisplaySpace(wid);
     defer c.c.CFRelease(wid_arr);
 
     const spaces = sl.SLSCopySpacesForWindows(cid, 0x7, wid_arr);
-    if (spaces == null) return 0;
+    if (spaces == null) return getDisplaySpace(wid);
     defer c.c.CFRelease(spaces);
 
-    if (c.c.CFArrayGetCount(spaces) == 0) return 0;
+    if (c.c.CFArrayGetCount(spaces) == 0) return getDisplaySpace(wid);
 
     const space_num: c.c.CFNumberRef = @ptrCast(c.c.CFArrayGetValueAtIndex(spaces, 0));
     var space_id: u64 = 0;
     _ = c.c.CFNumberGetValue(space_num, c.c.kCFNumberSInt64Type, &space_id);
+
+    if (space_id == 0) return getDisplaySpace(wid);
+
+    // Validate: check if the reported space is actually on the window's display
+    // If not, the window was moved to the display's current space (display hotplug)
+    const display_space = getDisplaySpace(wid);
+    if (display_space != 0) {
+        // Get display for the reported space
+        const space_display_uuid = sl.SLSCopyManagedDisplayForSpace(cid, space_id);
+        const window_display_uuid = sl.SLSCopyManagedDisplayForWindow(cid, wid);
+
+        if (space_display_uuid != null and window_display_uuid != null) {
+            defer c.c.CFRelease(space_display_uuid);
+            defer c.c.CFRelease(window_display_uuid);
+
+            // If the space's display doesn't match the window's display,
+            // the window was moved to the current visible space on its display
+            if (c.c.CFStringCompare(space_display_uuid, window_display_uuid, 0) != c.c.kCFCompareEqualTo) {
+                return display_space;
+            }
+        } else {
+            if (space_display_uuid) |uuid| c.c.CFRelease(uuid);
+            if (window_display_uuid) |uuid| c.c.CFRelease(uuid);
+        }
+    }
+
     return space_id;
+}
+
+/// Get the current space of the display that contains this window
+/// Used as fallback when SLSCopySpacesForWindows fails
+pub fn getDisplaySpace(wid: Id) u64 {
+    const sl = skylight.get() catch return 0;
+    const cid = sl.SLSMainConnectionID();
+
+    // Get display UUID for this window
+    const uuid = sl.SLSCopyManagedDisplayForWindow(cid, wid);
+    if (uuid == null) return 0;
+    defer c.c.CFRelease(uuid);
+
+    // Get current space on that display
+    return sl.SLSManagedDisplayGetCurrentSpace(cid, uuid);
+}
+
+/// Get display UUID based on window's actual screen position (geometry-based)
+/// This is more reliable than SLSCopyManagedDisplayForWindow after display hotplug
+/// Returns null if unable to determine. Caller must CFRelease.
+pub fn getDisplayByGeometry(wid: Id) ?c.CFStringRef {
+    const sl = skylight.get() catch return null;
+    const cid = sl.SLSMainConnectionID();
+
+    // Get actual window bounds on screen
+    var rect: c.CGRect = undefined;
+    if (sl.SLSGetWindowBounds(cid, wid, &rect) != 0) return null;
+
+    // Find which display this rect is on
+    return sl.SLSCopyBestManagedDisplayForRect(cid, rect);
+}
+
+/// Get the current space based on window's actual screen position
+/// More reliable than getDisplaySpace after display hotplug
+pub fn getSpaceByGeometry(wid: Id) u64 {
+    const sl = skylight.get() catch return 0;
+    const cid = sl.SLSMainConnectionID();
+
+    const uuid = getDisplayByGeometry(wid) orelse return 0;
+    defer c.c.CFRelease(uuid);
+
+    return sl.SLSManagedDisplayGetCurrentSpace(cid, uuid);
 }
 
 // ============================================================================

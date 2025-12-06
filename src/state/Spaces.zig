@@ -89,6 +89,11 @@ pub fn removeLabel(self: *Spaces, sid: Space.Id) bool {
     return self.labels.remove(sid);
 }
 
+/// Clear all space labels
+pub fn clearLabels(self: *Spaces) void {
+    self.labels.clear();
+}
+
 /// Set current space
 pub fn setCurrentSpace(self: *Spaces, sid: Space.Id) void {
     if (self.current_space_id) |current| {

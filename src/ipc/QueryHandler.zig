@@ -1,6 +1,6 @@
 ///! Query handlers for IPC --query commands
 ///!
-///! Handles: displays, spaces, windows queries
+///! Handles: displays, spaces, windows, traces queries
 const std = @import("std");
 const c = @import("../platform/c.zig");
 const skylight = @import("../platform/skylight.zig");
@@ -11,6 +11,7 @@ const Display = @import("../core/Display.zig");
 const Displays = @import("../state/Displays.zig");
 const Windows = @import("../state/Windows.zig");
 const Spaces = @import("../state/Spaces.zig");
+const trace = @import("../trace/Tracer.zig");
 
 /// Context needed for query operations
 pub const Context = struct {
@@ -272,9 +273,21 @@ pub fn handleQuery(ctx: Context, client_fd: std.posix.socket_t, args: []const u8
         querySpaces(ctx, client_fd);
     } else if (std.mem.eql(u8, target, "--windows")) {
         queryWindows(ctx, client_fd);
+    } else if (std.mem.eql(u8, target, "--traces")) {
+        queryTraces(client_fd);
     } else {
         Server.sendErr(client_fd, Response.err(.unknown_command));
     }
+}
+
+/// Query traces - returns Chrome Trace Format JSON for Perfetto
+pub fn queryTraces(client_fd: std.posix.socket_t) void {
+    var buf: [1024 * 1024]u8 = undefined; // 1MB buffer for traces
+    const json = trace.writeToBuffer(&buf) catch {
+        sendJsonError(client_fd, "trace_error", "failed to write trace data");
+        return;
+    };
+    Server.sendResponse(client_fd, json);
 }
 
 /// Parse query target from args (for testing)
@@ -284,6 +297,7 @@ pub fn parseQueryTarget(args: []const u8) ?QueryTarget {
     if (std.mem.eql(u8, target, "--displays")) return .displays;
     if (std.mem.eql(u8, target, "--spaces")) return .spaces;
     if (std.mem.eql(u8, target, "--windows")) return .windows;
+    if (std.mem.eql(u8, target, "--traces")) return .traces;
     return null;
 }
 
@@ -291,6 +305,7 @@ pub const QueryTarget = enum {
     displays,
     spaces,
     windows,
+    traces,
 };
 
 // ============================================================================
@@ -309,6 +324,10 @@ test "parseQueryTarget spaces" {
 
 test "parseQueryTarget windows" {
     try testing.expectEqual(QueryTarget.windows, parseQueryTarget("--windows"));
+}
+
+test "parseQueryTarget traces" {
+    try testing.expectEqual(QueryTarget.traces, parseQueryTarget("--traces"));
 }
 
 test "parseQueryTarget null-terminated" {

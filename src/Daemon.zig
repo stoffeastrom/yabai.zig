@@ -20,6 +20,7 @@ const Event = @import("events/Event.zig").Event;
 const sa_extractor = @import("sa/extractor.zig");
 const sa_patterns = @import("sa/patterns.zig");
 const SAClient = @import("sa/client.zig").Client;
+const trace = @import("trace/Tracer.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -38,6 +39,72 @@ pub const SACapabilities = struct {
     can_focus_window: bool = false,
     /// Discovered function addresses (for future use)
     discovery: ?sa_extractor.DiscoveryResult = null,
+};
+
+/// Dirty state flags - accumulated during event handling, processed once per loop tick
+pub const DirtyFlags = packed struct(u16) {
+    /// Need to apply layout to current space
+    layout_current: bool = false,
+    /// Need to apply layout to all visible spaces
+    layout_all: bool = false,
+    /// Need to rescan running applications
+    scan_apps: bool = false,
+    /// Need to sync space labels with config
+    sync_spaces: bool = false,
+    /// Need to rebuild BSP tree (not just reapply)
+    rebuild_view: bool = false,
+    /// Need to sync config to state
+    sync_config: bool = false,
+    /// Reserved for future use
+    _padding: u10 = 0,
+
+    /// Check if any work is pending
+    pub fn any(self: DirtyFlags) bool {
+        return @as(u16, @bitCast(self)) != 0;
+    }
+
+    /// Clear all flags
+    pub fn clear(self: *DirtyFlags) void {
+        self.* = .{};
+    }
+};
+
+/// Dirty space tracking - which spaces need layout
+pub const DirtySpaces = struct {
+    /// Spaces that need layout (by space ID)
+    spaces: [16]u64 = [_]u64{0} ** 16,
+    count: u8 = 0,
+
+    /// Mark a space as needing layout
+    pub fn mark(self: *DirtySpaces, space_id: u64) void {
+        // Check if already marked
+        for (self.spaces[0..self.count]) |sid| {
+            if (sid == space_id) return;
+        }
+        // Add if room
+        if (self.count < self.spaces.len) {
+            self.spaces[self.count] = space_id;
+            self.count += 1;
+        }
+    }
+
+    /// Check if a space is marked dirty
+    pub fn isDirty(self: *const DirtySpaces, space_id: u64) bool {
+        for (self.spaces[0..self.count]) |sid| {
+            if (sid == space_id) return true;
+        }
+        return false;
+    }
+
+    /// Clear all marked spaces
+    pub fn clear(self: *DirtySpaces) void {
+        self.count = 0;
+    }
+
+    /// Check if any spaces are dirty
+    pub fn any(self: *const DirtySpaces) bool {
+        return self.count > 0;
+    }
 };
 
 pub const Daemon = struct {
@@ -93,6 +160,18 @@ pub const Daemon = struct {
     ffm_window_id: u32 = 0, // One-shot: window ID that FFM is currently focusing (cleared on focus confirm)
     last_ffm_time: i64 = 0, // Timestamp of last FFM focus attempt (nanoseconds)
     last_validation_time: i64 = 0, // Timestamp of last state validation
+
+    // Dirty state - accumulated during events, processed once per loop tick
+    dirty: DirtyFlags = .{},
+    dirty_spaces: DirtySpaces = .{},
+
+    // Display change debouncing - coalesce rapid-fire callbacks
+    display_change_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    display_change_time: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+
+    // Deferred window moves - when SA was unavailable during display change
+    pending_window_moves: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    pending_moves_time: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
     // Global instance pointer for static callbacks
     var instance: ?*Self = null;
@@ -247,7 +326,7 @@ pub const Daemon = struct {
         _ = c.c.CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, null);
     }
 
-    /// Display reconfiguration callback
+    /// Display reconfiguration callback - just marks pending, actual work is debounced
     fn displayReconfigurationCallback(
         display_id: c.c.CGDirectDisplayID,
         flags: u32,
@@ -259,34 +338,106 @@ pub const Daemon = struct {
         if (self.shutting_down.load(.acquire)) return;
 
         const kCGDisplayBeginConfigurationFlag: u32 = 1 << 0;
-        const kCGDisplayAddFlag: u32 = 1 << 4;
         const kCGDisplayRemoveFlag: u32 = 1 << 5;
 
+        // Ignore "begin configuration" - wait for actual changes
         if (flags & kCGDisplayBeginConfigurationFlag != 0) return;
 
-        const is_add = flags & kCGDisplayAddFlag != 0;
-        const is_remove = flags & kCGDisplayRemoveFlag != 0;
-        const is_final = flags == 0;
-
-        if (is_remove) {
-            log.info("display removed: {}", .{display_id});
-            _ = self.displays.removeLabel(display_id);
-            self.syncSpaces(); // Re-assign space labels to remaining displays
-            self.applyAllSpaceLayouts();
-        } else if (is_add or is_final) {
-            if (is_add) {
-                log.info("display added: {}", .{display_id});
+        // On remove, clear the label immediately (display ID is still valid)
+        if (flags & kCGDisplayRemoveFlag != 0) {
+            const removed_label = self.displays.getLabelForDisplay(display_id);
+            if (removed_label != null) {
+                log.info("display removed: {} ({?s})", .{ display_id, removed_label });
+                _ = self.displays.removeLabel(display_id);
             }
-
-            // Give macOS time to settle
-            std.Thread.sleep(500 * std.time.ns_per_ms);
-
-            // Re-match displays, sync spaces, and re-apply rules
-            self.matchDisplays();
-            self.syncSpaces();
-            self.reapplyRules();
-            self.applyAllSpaceLayouts();
+        } else {
+            log.debug("display event: {} flags=0x{x}", .{ display_id, flags });
         }
+
+        // Mark change pending and update timestamp - actual sync happens in run loop
+        const now: i64 = @truncate(std.time.nanoTimestamp());
+        self.display_change_time.store(now, .release);
+        self.display_change_pending.store(true, .release);
+    }
+
+    /// Handle display change after debounce period - single clean sync pass
+    fn handleDisplayChangeSettled(self: *Self) void {
+        // 1. Query current display configuration
+        self.matchDisplays();
+
+        // 2. Refresh window space IDs from macOS (they may have moved)
+        _ = self.refreshWindowSpaceIds();
+
+        // 3. Build target state (which labels go to which display)
+        self.spaces.clearLabels();
+        var target = self.buildTargetState();
+
+        // 4. Sync space count - create/destroy spaces to match config
+        // Add small delay to let macOS finish space migration
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+        const space_stats = self.syncSpaceCountUnified(&target);
+
+        if (space_stats.created > 0 or space_stats.destroyed > 0) {
+            // Space IDs changed, wait and rebuild target
+            std.Thread.sleep(300 * std.time.ns_per_ms);
+            _ = self.refreshWindowSpaceIds();
+            self.spaces.clearLabels();
+            target = self.buildTargetState();
+        }
+
+        // 5. Label spaces by position only (not by windows - we want to MOVE windows)
+        self.labelRemainingByPosition(&target);
+
+        // 6. Move windows to correct spaces based on rules
+        const moves = self.moveWindowsToMatchLabels();
+
+        // 7. Layout visible spaces
+        self.layoutVisibleSpaces();
+
+        log.info("display change: sync complete (created={}, destroyed={}, moves={})", .{ space_stats.created, space_stats.destroyed, moves });
+    }
+
+    /// Log current display/space/window state for debugging
+    fn logDisplayState(self: *Self, context: []const u8) void {
+        log.info("--- state {s} ---", .{context});
+
+        // Log displays
+        const displays = Displays.getActiveDisplayList(self.allocator) catch {
+            log.info("  displays: (failed to get)", .{});
+            return;
+        };
+        defer self.allocator.free(displays);
+
+        for (displays) |did| {
+            const label = self.displays.getLabelForDisplay(did) orelse "(unlabeled)";
+            const builtin_str: []const u8 = if (c.c.CGDisplayIsBuiltin(did) != 0) "builtin" else "external";
+            log.info("  display {}: {s} ({s})", .{ did, label, builtin_str });
+
+            // Log spaces on this display
+            const display_spaces = Display.getSpaceList(self.allocator, did) catch continue;
+            defer self.allocator.free(display_spaces);
+
+            for (display_spaces) |sid| {
+                const space_label = self.spaces.getLabelForSpace(sid) orelse "(unlabeled)";
+                const space_type = Space.getType(sid);
+                const type_str = switch (space_type) {
+                    .user => "user",
+                    .system => "system",
+                    .fullscreen => "fullscreen",
+                };
+
+                // Count windows on this space
+                var win_count: usize = 0;
+                var it = self.windows.iterator();
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.space_id == sid) win_count += 1;
+                }
+
+                log.info("    space {}: {s} ({s}) - {} windows", .{ sid, space_label, type_str, win_count });
+            }
+        }
+
+        log.info("--- end state ---", .{});
     }
 
     /// Re-apply rules to all tracked windows
@@ -295,6 +446,7 @@ pub const Daemon = struct {
         while (it.next()) |entry| {
             const wid = entry.key_ptr.*;
             const win = entry.value_ptr;
+            const current_space = win.space_id;
 
             var name_buf: [256]u8 = undefined;
             const name_len = c.c.proc_name(win.pid, &name_buf, 256);
@@ -307,10 +459,10 @@ pub const Daemon = struct {
             for (rules) |rule| {
                 if (rule.space) |space_name| {
                     if (self.resolveSpaceName(space_name)) |target_space| {
-                        if (target_space != win.space_id) {
+                        if (target_space != current_space) {
                             Space.moveWindows(&[_]u32{wid}, target_space) catch continue;
                             log.info("rule: moved {s} window {} to space {s}", .{ app_name, wid, space_name });
-                            win.space_id = target_space;
+                            self.windows.setWindowSpace(wid, target_space);
                         }
                     }
                 }
@@ -531,11 +683,13 @@ pub const Daemon = struct {
         switch (event) {
             .application_launched => |e| {
                 if (e.pid > 0 and e.pid != self.pid) {
+                    trace.instant("app_launched", .event, .{ .pid = e.pid });
                     self.handleApplicationLaunched(e.pid);
                 }
             },
             .application_terminated => |e| {
                 if (e.pid > 0) {
+                    trace.instant("app_terminated", .event, .{ .pid = e.pid });
                     self.handleApplicationTerminated(e.pid);
                 }
             },
@@ -552,14 +706,17 @@ pub const Daemon = struct {
                 self.handleApplicationVisible(e.pid);
             },
             .space_changed => |_| {
+                trace.instant("space_changed", .space, .{});
                 log.debug("space changed", .{});
                 self.handleSpaceChanged();
             },
             .display_changed => |_| {
-                log.debug("display changed", .{});
-                self.handleDisplayChanged();
+                // Note: This is "active display changed" (focus moved between monitors)
+                // NOT display reconfiguration (add/remove). No need to relayout.
+                log.debug("active display changed (no relayout needed)", .{});
             },
             .system_woke => {
+                trace.instant("system_woke", .event, .{});
                 log.info("system woke - rebuilding layouts", .{});
                 self.handleSystemWoke();
             },
@@ -627,18 +784,16 @@ pub const Daemon = struct {
             return error.NoUser;
         };
 
-        // Format socket paths
-        _ = std.fmt.bufPrint(&self.socket_path, "/tmp/yabai.zig_{s}.socket", .{user}) catch unreachable;
-        _ = std.fmt.bufPrint(&self.sa_socket_path, "/tmp/yabai-sa_{s}.socket", .{user}) catch unreachable;
-        _ = std.fmt.bufPrint(&self.lock_path, "/tmp/yabai.zig_{s}.lock", .{user}) catch unreachable;
-
-        // Null terminate for C interop
-        self.socket_path[std.mem.indexOf(u8, &self.socket_path, &[_]u8{0}) orelse MAXLEN - 1] = 0;
-        self.sa_socket_path[std.mem.indexOf(u8, &self.sa_socket_path, &[_]u8{0}) orelse MAXLEN - 1] = 0;
-        self.lock_path[std.mem.indexOf(u8, &self.lock_path, &[_]u8{0}) orelse MAXLEN - 1] = 0;
+        // Format socket paths - buffers are 512 bytes, paths are ~40 chars max
+        // Username max is ~256 chars on macOS, so this cannot overflow
+        _ = std.fmt.bufPrintZ(&self.socket_path, "/tmp/yabai.zig_{s}.socket", .{user}) catch unreachable;
+        _ = std.fmt.bufPrintZ(&self.sa_socket_path, "/tmp/yabai.zig-sa_{s}.socket", .{user}) catch unreachable;
+        _ = std.fmt.bufPrintZ(&self.lock_path, "/tmp/yabai.zig_{s}.lock", .{user}) catch unreachable;
 
         // Initialize SA client with socket path
-        self.sa_client = SAClient.init(std.mem.sliceTo(&self.sa_socket_path, 0));
+        const sa_path = std.mem.sliceTo(&self.sa_socket_path, 0);
+        log.debug("SA socket path: {s} (len={}, ptr={*})", .{ sa_path, sa_path.len, sa_path.ptr });
+        self.sa_client = SAClient.init(sa_path);
     }
 
     fn acquireLock(self: *Self) InitError!void {
@@ -776,6 +931,9 @@ pub const Daemon = struct {
 
     /// Handle incoming IPC message using typed command parsing
     fn handleMessage(client_fd: std.posix.socket_t, message: []const u8, context: ?*anyopaque) void {
+        const span = trace.begin("ipc_message", .ipc);
+        defer span.end();
+
         const context_ptr = context orelse {
             log.err("handleMessage: null context", .{});
             Server.sendErr(client_fd, Response.err(.unknown_domain));
@@ -853,6 +1011,7 @@ pub const Daemon = struct {
             .spaces = &self.spaces,
             .displays = &self.displays,
             .config = &self.config,
+            .sa_client = if (self.sa_client) |*client| client else null,
             .applyLayout = applyLayoutCallback,
             .getBoundsForSpace = getBoundsCallback,
         };
@@ -1092,6 +1251,9 @@ pub const Daemon = struct {
 
     /// Apply layout to a specific space
     fn applyLayoutToSpace(self: *Self, space_id: u64) void {
+        const span = trace.beginArgs("apply_layout", .layout, .{ .space = space_id });
+        defer span.end();
+
         if (self.getBoundsForSpace(space_id)) |bounds| {
             self.spaces.applyLayout(space_id, bounds, &self.windows) catch |err| {
                 log.err("failed to apply layout to space {d}: {}", .{ space_id, err });
@@ -1202,6 +1364,9 @@ pub const Daemon = struct {
                     break;
                 },
                 .timed_out, .handled_source => {
+                    // Process accumulated dirty state after handling events
+                    self.processDirtyState();
+
                     // Periodic state validation (every ~5 seconds on timeout)
                     if (result == .timed_out) {
                         self.periodicStateValidation();
@@ -1211,6 +1376,158 @@ pub const Daemon = struct {
         }
 
         log.info("exiting run loop", .{});
+    }
+
+    /// Run the main event loop with a timeout. Blocks until stop() is called or timeout expires.
+    pub fn runWithTimeout(self: *Self, timeout_ms: u64) void {
+        self.running.store(true, .release);
+        log.info("entering run loop (timeout={}ms)", .{timeout_ms});
+
+        const start_time: i64 = @truncate(std.time.nanoTimestamp());
+        const timeout_ns: i64 = @intCast(timeout_ms * std.time.ns_per_ms);
+
+        // Run the CFRunLoop - this is where all macOS events are delivered
+        while (self.running.load(.acquire)) {
+            // Check timeout
+            const now: i64 = @truncate(std.time.nanoTimestamp());
+            if (now - start_time >= timeout_ns) {
+                log.info("timeout reached, exiting", .{});
+                break;
+            }
+
+            // Process one event or timeout after 1 second
+            const result = runloop.runOnce(1.0);
+            switch (result) {
+                .finished => {
+                    log.info("run loop finished (no sources)", .{});
+                    break;
+                },
+                .stopped => {
+                    log.info("run loop stopped", .{});
+                    break;
+                },
+                .timed_out, .handled_source => {
+                    self.processDirtyState();
+                    if (result == .timed_out) {
+                        self.periodicStateValidation();
+                    }
+                },
+            }
+        }
+
+        log.info("exiting run loop", .{});
+    }
+
+    /// Process accumulated dirty state - called once per loop tick
+    fn processDirtyState(self: *Self) void {
+        // Check for debounced display change first (highest priority)
+        if (self.display_change_pending.load(.acquire)) {
+            const change_time = self.display_change_time.load(.acquire);
+            const now = std.time.nanoTimestamp();
+            const elapsed_ms = @divFloor(now - change_time, std.time.ns_per_ms);
+
+            // Wait 500ms after last display event before processing
+            if (elapsed_ms >= 500) {
+                self.display_change_pending.store(false, .release);
+                log.info("display change: processing after {}ms settle", .{elapsed_ms});
+                self.handleDisplayChangeSettled();
+                // Display change does its own layout, skip other dirty processing
+                self.dirty.clear();
+                self.dirty_spaces.clear();
+                return;
+            }
+        }
+
+        // Check for pending window moves (SA was unavailable during display change)
+        if (self.pending_window_moves.load(.acquire)) {
+            const move_time = self.pending_moves_time.load(.acquire);
+            const now = std.time.nanoTimestamp();
+            const elapsed_ms = @divFloor(now - move_time, std.time.ns_per_ms);
+
+            // Try every 200ms, give up after 5 seconds
+            if (elapsed_ms >= 200) {
+                if (elapsed_ms > 5000) {
+                    log.warn("pending moves: giving up after {}ms", .{elapsed_ms});
+                    self.pending_window_moves.store(false, .release);
+                } else if (self.sa_client) |sa| {
+                    if (sa.isAvailable()) {
+                        log.info("pending moves: SA available after {}ms, moving windows", .{elapsed_ms});
+                        self.pending_window_moves.store(false, .release);
+                        const moves = self.moveWindowsToMatchLabels();
+                        if (moves > 0) {
+                            self.layoutVisibleSpaces();
+                        }
+                        log.info("pending moves: completed {} moves", .{moves});
+                    } else {
+                        // Update time to retry in another 200ms
+                        self.pending_moves_time.store(@truncate(now), .release);
+                        log.debug("pending moves: SA still unavailable, will retry", .{});
+                    }
+                }
+            }
+        }
+
+        // Skip if nothing else to do
+        if (!self.dirty.any() and !self.dirty_spaces.any()) return;
+
+        const span = trace.begin("process_dirty", .event);
+        defer span.end();
+
+        // Process in priority order
+
+        // 1. Rescan apps (may add windows that need layout)
+        if (self.dirty.scan_apps) {
+            const s = trace.begin("scan_apps", .event);
+            defer s.end();
+            self.scanRunningApplications();
+        }
+
+        // 2. Sync spaces (may affect which spaces exist)
+        if (self.dirty.sync_spaces) {
+            const s = trace.begin("sync_spaces", .space);
+            defer s.end();
+            self.syncSpaces();
+        }
+
+        // 3. Sync config to state
+        if (self.dirty.sync_config) {
+            const s = trace.begin("sync_config", .config);
+            defer s.end();
+            self.syncConfigToState();
+        }
+
+        // 4. Rebuild views (before layout)
+        if (self.dirty.rebuild_view) {
+            const s = trace.begin("rebuild_view", .layout);
+            defer s.end();
+            if (self.getCurrentSpaceId()) |sid| {
+                self.spaces.removeView(sid);
+            }
+        }
+
+        // 5. Layout - either all spaces or specific dirty ones
+        if (self.dirty.layout_all) {
+            const s = trace.begin("layout_all", .layout);
+            defer s.end();
+            self.applyAllSpaceLayouts();
+        } else if (self.dirty.layout_current) {
+            const s = trace.begin("layout_current", .layout);
+            defer s.end();
+            self.applyCurrentLayout();
+        } else if (self.dirty_spaces.any()) {
+            // Layout only specific dirty spaces (but only if visible)
+            for (self.dirty_spaces.spaces[0..self.dirty_spaces.count]) |sid| {
+                if (Space.isVisible(sid)) {
+                    self.applyLayoutToSpace(sid);
+                } else {
+                    log.debug("skipping layout for non-visible space {}", .{sid});
+                }
+            }
+        }
+
+        // Clear all dirty state
+        self.dirty.clear();
+        self.dirty_spaces.clear();
     }
 
     /// Stop the run loop
@@ -1340,18 +1657,753 @@ pub const Daemon = struct {
     // Application tracking and auto-tiling
     // ============================================================================
 
+    /// Startup window move plan entry
+    const WindowMove = struct {
+        wid: Window.Id,
+        from_space: u64,
+        to_space: u64,
+    };
+
     /// Initialize application tracking - call after daemon is running
+    /// Unified space/window sync - handles startup and display changes
+    /// Smart algorithm: label based on windows first, minimize moves
+    ///
+    /// 1. Match displays to config labels
+    /// 2. Scan all windows (track what's where)
+    /// 3. Build target state (which labels go on which display)
+    /// 4. Label spaces based on windows present (smart matching)
+    /// 5. Sync space count (create/destroy to match config)
+    /// 6. Move windows to correct spaces (only if needed)
+    /// 7. Layout visible spaces
+    /// 8. Restore focus to original space
     pub fn startApplicationTracking(self: *Self) void {
         instance = self;
+        const span = trace.begin("startup", .event);
+        defer span.end();
 
-        // Match physical displays to config labels
+        log.info("startup: unified sync starting", .{});
+
+        // Remember current visible space on each display before sync
+        // (creating spaces can switch display focus)
+        var original_spaces: [8]u64 = [_]u64{0} ** 8;
+        var display_count: usize = 0;
+        {
+            const displays = Displays.getActiveDisplayList(self.allocator) catch &[_]u32{};
+            defer if (displays.len > 0) self.allocator.free(displays);
+            for (displays, 0..) |did, i| {
+                if (i >= 8) break;
+                original_spaces[i] = Display.getCurrentSpace(did) orelse 0;
+                display_count += 1;
+            }
+        }
+
+        const stats = self.syncSpacesAndWindows();
+        self.layoutVisibleSpaces();
+
+        // Restore focus if spaces were created (creating switches to new space)
+        if (stats.created > 0) {
+            if (self.sa_client) |sa| {
+                const displays = Displays.getActiveDisplayList(self.allocator) catch &[_]u32{};
+                defer if (displays.len > 0) self.allocator.free(displays);
+
+                for (displays, 0..) |did, i| {
+                    if (i >= display_count) break;
+                    const orig_sid = original_spaces[i];
+                    if (orig_sid == 0) continue;
+
+                    const current_sid = Display.getCurrentSpace(did) orelse continue;
+                    if (current_sid != orig_sid) {
+                        // Space was valid before, may have been destroyed - check if still exists
+                        if (Space.isUser(orig_sid)) {
+                            if (sa.focusSpace(orig_sid)) {
+                                log.info("startup: restored display {} to space {}", .{ did, orig_sid });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        log.info("startup: complete ({} windows, {} moves, {} spaces created, {} destroyed)", .{
+            self.windows.count(), stats.moves, stats.created, stats.destroyed,
+        });
+    }
+
+    /// Stats from sync operation
+    const SyncStats = struct {
+        moves: usize = 0,
+        created: usize = 0,
+        destroyed: usize = 0,
+    };
+
+    /// Unified sync - used for startup AND display changes
+    /// Returns stats about what was done
+    pub fn syncSpacesAndWindows(self: *Self) SyncStats {
+        var stats = SyncStats{};
+
+        // Step 1: Match displays to config labels
         self.matchDisplays();
 
-        // Sync spaces to match config (create/remove as needed)
-        self.syncSpaces();
+        // Step 2: Scan all windows (track what's where)
+        self.scanWindowsOnly();
 
-        // Now scan and track running applications
-        self.scanRunningApplications();
+        // Step 3: Build target state - which labels go where
+        // If a display is missing, its labels go to fallback (first available display)
+        var target = self.buildTargetState();
+
+        // Step 4: Label spaces based on windows present (smart matching)
+        // This tries to avoid moves by labeling spaces that already have the right app
+        self.labelSpacesByWindows(&target);
+
+        // Step 5: Sync space count per display
+        const space_stats = self.syncSpaceCountUnified(&target);
+        stats.created = space_stats.created;
+        stats.destroyed = space_stats.destroyed;
+
+        if (stats.created > 0 or stats.destroyed > 0) {
+            // Space IDs changed, rescan and relabel
+            std.Thread.sleep(200 * std.time.ns_per_ms);
+            self.scanWindowsOnly();
+            self.labelSpacesByWindows(&target);
+        }
+
+        // Step 6: Label remaining spaces by position
+        self.labelRemainingByPosition(&target);
+
+        // Step 7: Move windows to correct spaces
+        stats.moves = self.moveWindowsToMatchLabels();
+
+        return stats;
+    }
+
+    /// Target state for space sync
+    const TargetState = struct {
+        /// For each display, which space labels should be there
+        /// Index is display index (0 = first display), value is list of labels
+        display_labels: [8][16]?[]const u8 = [_][16]?[]const u8{[_]?[]const u8{null} ** 16} ** 8,
+        display_label_count: [8]usize = [_]usize{0} ** 8,
+        display_ids: [8]u32 = [_]u32{0} ** 8,
+        display_count: usize = 0,
+        /// Fallback display index for labels from missing displays
+        fallback_display: usize = 0,
+        /// Track which config space labels have been assigned
+        assigned_labels: std.StaticBitSet(64) = std.StaticBitSet(64).initEmpty(),
+    };
+
+    /// Build target state from config and current displays
+    fn buildTargetState(self: *Self) TargetState {
+        var target = TargetState{};
+
+        // Get active displays
+        const displays = Displays.getActiveDisplayList(self.allocator) catch return target;
+        defer self.allocator.free(displays);
+
+        target.display_count = @min(displays.len, 8);
+        for (displays[0..target.display_count], 0..) |did, i| {
+            target.display_ids[i] = did;
+        }
+
+        // For each config space, assign to display (or fallback)
+        for (self.config.spaces.items) |space_cfg| {
+            var assigned = false;
+
+            if (space_cfg.display) |target_display| {
+                // Find which display this should go to
+                for (0..target.display_count) |di| {
+                    const did = target.display_ids[di];
+                    const label = self.displays.getLabelForDisplay(did);
+                    if (label != null and std.mem.eql(u8, label.?, target_display)) {
+                        // Add to this display's labels
+                        const idx = target.display_label_count[di];
+                        if (idx < 16) {
+                            target.display_labels[di][idx] = space_cfg.name;
+                            target.display_label_count[di] += 1;
+                        }
+                        assigned = true;
+                        break;
+                    }
+                }
+            }
+
+            // If display not found (unplugged), add to fallback
+            if (!assigned and target.display_count > 0) {
+                const di = target.fallback_display;
+                const idx = target.display_label_count[di];
+                if (idx < 16) {
+                    target.display_labels[di][idx] = space_cfg.name;
+                    target.display_label_count[di] += 1;
+                }
+            }
+        }
+
+        // Log target state
+        for (0..target.display_count) |di| {
+            const did = target.display_ids[di];
+            const label = self.displays.getLabelForDisplay(did) orelse "?";
+            const count = target.display_label_count[di];
+
+            // Build list of space labels for this display
+            var label_list: [256]u8 = undefined;
+            var label_pos: usize = 0;
+            for (target.display_labels[di][0..count]) |lbl| {
+                if (lbl) |l| {
+                    if (label_pos > 0 and label_pos < 254) {
+                        label_list[label_pos] = ',';
+                        label_pos += 1;
+                    }
+                    const copy_len = @min(l.len, 255 - label_pos);
+                    @memcpy(label_list[label_pos..][0..copy_len], l[0..copy_len]);
+                    label_pos += copy_len;
+                }
+            }
+            log.info("sync: display {s} ({}) should have {} spaces: [{s}]", .{
+                label, did, count, label_list[0..label_pos],
+            });
+        }
+
+        return target;
+    }
+
+    /// Label spaces based on windows present
+    /// For each window, if its app has a rule, try to label its current space
+    fn labelSpacesByWindows(self: *Self, target: *TargetState) void {
+        // Clear existing labels
+        self.spaces.clearLabels();
+
+        var it = self.windows.iterator();
+        while (it.next()) |entry| {
+            const win = entry.value_ptr;
+            const space_id = win.space_id;
+
+            // Skip if already labeled
+            if (self.spaces.getLabelForSpace(space_id) != null) continue;
+
+            // Get app name
+            var app_name_buf: [256]u8 = undefined;
+            const name_len = c.c.proc_name(win.pid, &app_name_buf, 256);
+            if (name_len <= 0) continue;
+            const app_name = app_name_buf[0..@intCast(name_len)];
+
+            // Find rule for this app
+            const rules = self.config.findMatchingRules(app_name, null, self.allocator) catch continue;
+            defer if (rules.len > 0) self.allocator.free(rules);
+
+            for (rules) |rule| {
+                if (rule.space) |space_label| {
+                    // Check if this label is in our target state and not yet assigned
+                    const label_idx = self.findLabelIndex(space_label);
+                    if (label_idx != null and !target.assigned_labels.isSet(label_idx.?)) {
+                        // Check if this space is on the right display for this label
+                        const space_display = Space.getDisplayId(space_id);
+                        const target_display = self.getTargetDisplayForLabel(target, space_label);
+
+                        if (space_display != null and target_display != null and space_display.? == target_display.?) {
+                            // Perfect match - window is on correct display, label the space
+                            self.spaces.setLabel(space_id, space_label) catch continue;
+                            target.assigned_labels.set(label_idx.?);
+                            log.info("sync: labeled space {} as '{s}' (from {s} window)", .{ space_id, space_label, app_name });
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Find config index for a space label
+    fn findLabelIndex(self: *Self, label: []const u8) ?usize {
+        for (self.config.spaces.items, 0..) |space_cfg, idx| {
+            if (std.mem.eql(u8, space_cfg.name, label)) return idx;
+        }
+        return null;
+    }
+
+    /// Get target display ID for a label
+    fn getTargetDisplayForLabel(_: *Self, target: *const TargetState, label: []const u8) ?u32 {
+        for (0..target.display_count) |di| {
+            for (target.display_labels[di][0..target.display_label_count[di]]) |lbl| {
+                if (lbl != null and std.mem.eql(u8, lbl.?, label)) {
+                    return target.display_ids[di];
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Result from sync space count operation
+    const SpaceCountResult = struct {
+        created: usize = 0,
+        destroyed: usize = 0,
+    };
+
+    /// Sync space count per display, returns created/destroyed counts
+    fn syncSpaceCountUnified(self: *Self, target: *const TargetState) SpaceCountResult {
+        var result = SpaceCountResult{};
+        const sa = self.sa_client orelse return result;
+
+        for (0..target.display_count) |di| {
+            const did = target.display_ids[di];
+            const want = target.display_label_count[di];
+            if (want == 0) continue;
+
+            // Get current user spaces
+            const display_spaces = Display.getSpaceList(self.allocator, did) catch continue;
+            defer self.allocator.free(display_spaces);
+
+            var user_spaces: [32]u64 = undefined;
+            var have: usize = 0;
+            for (display_spaces) |sid| {
+                if (Space.isUser(sid) and have < 32) {
+                    user_spaces[have] = sid;
+                    have += 1;
+                }
+            }
+
+            const label = self.displays.getLabelForDisplay(did) orelse "?";
+
+            // Create missing spaces
+            if (have < want) {
+                const to_create = want - have;
+                log.info("sync: creating {} spaces on {s} (have={}, want={}, last_space={})", .{ to_create, label, have, want, if (have > 0) user_spaces[have - 1] else 0 });
+                const last_space = if (have > 0) user_spaces[have - 1] else continue;
+                for (0..to_create) |_| {
+                    if (sa.createSpace(last_space)) {
+                        result.created += 1;
+                    } else break;
+                    std.Thread.sleep(100 * std.time.ns_per_ms);
+                }
+            }
+
+            // Destroy extra spaces (from the end, empty ones first)
+            if (have > want) {
+                var to_destroy = have - want;
+                log.info("sync: need to remove {} spaces from {s}", .{ to_destroy, label });
+
+                // Try to destroy from end, but only empty spaces
+                var idx = have;
+                while (idx > want and to_destroy > 0) {
+                    idx -= 1;
+                    const sid = user_spaces[idx];
+
+                    // Check if space has windows
+                    const has_windows = self.spaceHasWindows(sid);
+                    if (!has_windows) {
+                        if (sa.destroySpace(sid)) {
+                            log.info("sync: destroyed empty space {}", .{sid});
+                            result.destroyed += 1;
+                            to_destroy -= 1;
+                        }
+                        std.Thread.sleep(100 * std.time.ns_per_ms);
+                    }
+                }
+
+                // If still have extras, move windows off and destroy
+                if (to_destroy > 0 and have > want) {
+                    log.info("sync: {} non-empty spaces to remove, moving windows", .{to_destroy});
+                    // Move windows from last spaces to first space
+                    idx = have;
+                    while (idx > want and to_destroy > 0) {
+                        idx -= 1;
+                        const sid = user_spaces[idx];
+                        self.moveWindowsFromSpace(sid, user_spaces[0]);
+                        if (sa.destroySpace(sid)) {
+                            result.destroyed += 1;
+                            to_destroy -= 1;
+                        }
+                        std.Thread.sleep(100 * std.time.ns_per_ms);
+                    }
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /// Check if a space has any tracked windows
+    fn spaceHasWindows(self: *Self, space_id: u64) bool {
+        var it = self.windows.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.space_id == space_id) return true;
+        }
+        return false;
+    }
+
+    /// Label remaining unlabeled spaces by position
+    fn labelRemainingByPosition(self: *Self, target: *TargetState) void {
+        for (0..target.display_count) |di| {
+            const did = target.display_ids[di];
+
+            // Get user spaces in order
+            const display_spaces = Display.getSpaceList(self.allocator, did) catch continue;
+            defer self.allocator.free(display_spaces);
+
+            var user_spaces: [32]u64 = undefined;
+            var user_count: usize = 0;
+            for (display_spaces) |sid| {
+                if (Space.isUser(sid) and user_count < 32) {
+                    user_spaces[user_count] = sid;
+                    user_count += 1;
+                }
+            }
+
+            // For each target label on this display, find a space
+            for (target.display_labels[di][0..target.display_label_count[di]]) |lbl| {
+                const label = lbl orelse continue;
+
+                // Skip if already assigned
+                if (self.spaces.getSpaceForLabel(label) != null) continue;
+
+                // Find first unlabeled space
+                for (user_spaces[0..user_count]) |sid| {
+                    if (self.spaces.getLabelForSpace(sid) == null) {
+                        self.spaces.setLabel(sid, label) catch continue;
+                        log.info("sync: labeled space {} as '{s}' (by position)", .{ sid, label });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Move windows to their correct spaces based on rules
+    fn moveWindowsToMatchLabels(self: *Self) usize {
+        const sa = self.sa_client orelse return 0;
+
+        // Check if SA is available - if not, schedule deferred moves
+        if (!sa.isAvailable()) {
+            log.info("moveWindowsToMatchLabels: SA not available, scheduling deferred moves", .{});
+            const now: i64 = @truncate(std.time.nanoTimestamp());
+            self.pending_moves_time.store(now, .release);
+            self.pending_window_moves.store(true, .release);
+            return 0;
+        }
+
+        var move_count: usize = 0;
+        var it = self.windows.iterator();
+
+        while (it.next()) |entry| {
+            const wid = entry.key_ptr.*;
+            const win = entry.value_ptr;
+            const current_space = win.space_id;
+            const pid = win.pid;
+
+            // Get app name
+            var app_name_buf: [256]u8 = undefined;
+            const name_len = c.c.proc_name(pid, &app_name_buf, 256);
+            if (name_len <= 0) continue;
+            const app_name = app_name_buf[0..@intCast(name_len)];
+
+            // Find rule for this app
+            const rules = self.config.findMatchingRules(app_name, null, self.allocator) catch continue;
+            defer if (rules.len > 0) self.allocator.free(rules);
+
+            log.debug("moveWindows: {s} wid={} space={} rules={}", .{ app_name, wid, current_space, rules.len });
+
+            for (rules) |rule| {
+                if (rule.space) |target_label| {
+                    // Get target space ID from label
+                    const target_space = self.spaces.getSpaceForLabel(target_label) orelse {
+                        log.debug("moveWindows: {s} target '{s}' not found", .{ app_name, target_label });
+                        break;
+                    };
+                    if (target_space == current_space) {
+                        log.debug("moveWindows: {s} already on target space {}", .{ app_name, target_space });
+                        break; // Already correct
+                    }
+
+                    // Move window to target space
+                    if (sa.moveWindowToSpace(target_space, wid)) {
+                        log.info("sync: moved {s} wid={} from space {} to '{s}' ({})", .{
+                            app_name, wid, current_space, target_label, target_space,
+                        });
+                        self.windows.setWindowSpace(wid, target_space);
+                        move_count += 1;
+                    } else {
+                        log.warn("moveWindows: failed to move {s} wid={} to space {}", .{ app_name, wid, target_space });
+                    }
+                    break;
+                }
+            }
+        }
+
+        return move_count;
+    }
+
+    /// Scan all windows without applying rules or moving them
+    fn scanWindowsOnly(self: *Self) void {
+        // First, refresh space IDs for existing tracked windows
+        // (macOS may have moved them during display reconfiguration)
+        _ = self.refreshWindowSpaceIds();
+
+        const workspace = @import("platform/workspace.zig");
+        const pids = workspace.getRunningAppPids(self.allocator, self.pid) catch |err| {
+            log.err("sync: failed to get running apps: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(pids);
+
+        log.debug("sync: scanning {} apps", .{pids.len});
+        for (pids) |pid| {
+            self.addApplicationWithPidNoRules(pid);
+        }
+    }
+
+    /// Refresh space IDs for all tracked windows from macOS
+    /// Call this after display reconfiguration when windows may have moved
+    /// Returns true if any windows were detected as moved
+    fn refreshWindowSpaceIds(self: *Self) bool {
+        var any_moved = false;
+        var it = self.windows.iterator();
+        while (it.next()) |entry| {
+            const wid = entry.key_ptr.*;
+            const old_space = entry.value_ptr.space_id;
+            const queried_space = Window.getSpace(wid);
+            const display_space = Window.getDisplaySpace(wid);
+            const geometry_space = Window.getSpaceByGeometry(wid);
+
+            // After display hotplug, SkyLight APIs may return stale data.
+            // Trust geometry-based detection first (where the window actually is on screen),
+            // then fall back to display's current space, then queried space.
+            const new_space = if (geometry_space != 0)
+                geometry_space
+            else if (display_space != 0 and display_space != queried_space)
+                display_space
+            else
+                queried_space;
+
+            log.debug("refreshWindowSpaceIds: wid={} old={} queried={} display={} geometry={} -> {}", .{ wid, old_space, queried_space, display_space, geometry_space, new_space });
+
+            if (new_space != 0 and new_space != old_space) {
+                log.info("sync: window {} moved from space {} to {}", .{ wid, old_space, new_space });
+                // Use setWindowSpace which properly updates the by_space index
+                self.windows.setWindowSpace(wid, new_space);
+                any_moved = true;
+            }
+        }
+        return any_moved;
+    }
+
+    /// Move all tracked windows from one space to another
+    fn moveWindowsFromSpace(self: *Self, from_sid: u64, to_sid: u64) void {
+        const sa = self.sa_client orelse return;
+        var it = self.windows.iterator();
+        while (it.next()) |entry| {
+            const wid = entry.key_ptr.*;
+            const current_space = entry.value_ptr.space_id;
+            if (current_space == from_sid) {
+                if (sa.moveWindowToSpace(to_sid, wid)) {
+                    self.windows.setWindowSpace(wid, to_sid);
+                    log.debug("sync: moved wid={} from space {} to {}", .{ wid, from_sid, to_sid });
+                }
+            }
+        }
+    }
+
+    /// Add application and its windows without applying space rules
+    fn addApplicationWithPidNoRules(self: *Self, pid: c.pid_t) void {
+        var app_name_buf: [256]u8 = undefined;
+        const name_len = c.c.proc_name(pid, &app_name_buf, 256);
+        const app_name: []const u8 = if (name_len > 0) app_name_buf[0..@intCast(name_len)] else "?";
+
+        if (self.apps.getApplication(pid) != null) {
+            log.debug("startup: {s} (pid={}) already tracked", .{ app_name, pid });
+            return;
+        }
+
+        const ax_ref = ax.createApplicationElement(pid);
+        if (ax_ref == null) {
+            log.debug("startup: {s} (pid={}) no AX ref", .{ app_name, pid });
+            return;
+        }
+
+        const observer = ax.createObserver(pid, axObserverCallback) catch {
+            c.c.CFRelease(ax_ref);
+            return;
+        };
+
+        // Subscribe to notifications
+        ax.observerAddNotification(observer, ax_ref, ax.Notification.window_created, null) catch {};
+        ax.observerAddNotification(observer, ax_ref, ax.Notification.focused_window_changed, null) catch {};
+        ax.observerAddNotification(observer, ax_ref, ax.Notification.window_minimized, null) catch {};
+        ax.observerAddNotification(observer, ax_ref, ax.Notification.window_deminimized, null) catch {};
+
+        const source = ax.observerGetRunLoopSource(observer);
+        c.c.CFRunLoopAddSource(c.c.CFRunLoopGetMain(), source, c.c.kCFRunLoopDefaultMode);
+
+        self.apps.addApplication(.{
+            .pid = pid,
+            .ax_ref = ax_ref,
+            .observer = observer,
+            .is_observing = true,
+        }) catch {
+            c.c.CFRunLoopRemoveSource(c.c.CFRunLoopGetMain(), source, c.c.kCFRunLoopDefaultMode);
+            c.c.CFRelease(observer);
+            c.c.CFRelease(ax_ref);
+            return;
+        };
+
+        // Add windows (just track, no moves)
+        self.addWindowsNoRules(pid, ax_ref, observer);
+    }
+
+    /// Add windows from an app without applying space rules
+    fn addWindowsNoRules(self: *Self, pid: c.pid_t, ax_ref: c.AXUIElementRef, observer: c.c.AXObserverRef) void {
+        var app_name_buf: [256]u8 = undefined;
+        const name_len = c.c.proc_name(pid, &app_name_buf, 256);
+        const app_name: []const u8 = if (name_len > 0) app_name_buf[0..@intCast(name_len)] else "?";
+
+        const windows = Application.getWindowList(ax_ref) orelse {
+            log.debug("startup: {s} (pid={}) no windows from AX", .{ app_name, pid });
+            return;
+        };
+        defer c.c.CFRelease(windows);
+
+        const count: usize = @intCast(c.c.CFArrayGetCount(windows));
+        log.debug("startup: {s} (pid={}) has {} AX windows", .{ app_name, pid, count });
+
+        for (0..count) |i| {
+            const win_ref: c.AXUIElementRef = @ptrCast(@constCast(c.c.CFArrayGetValueAtIndex(windows, @intCast(i))));
+            if (win_ref == null) continue;
+
+            const wid = Application.getWindowId(win_ref) orelse continue;
+            const space_id = Window.getSpace(wid);
+            if (space_id == 0) {
+                log.debug("startup: {s} wid={} has no space", .{ app_name, wid });
+                continue;
+            }
+
+            // Check if managed (respect manage=false rules, but don't move)
+            var should_manage = self.shouldManageWindow(win_ref);
+            {
+                const rules = self.config.findMatchingRules(app_name, null, self.allocator) catch &[_]*const Config.AppRule{};
+                defer if (rules.len > 0) self.allocator.free(rules);
+                for (rules) |rule| {
+                    if (rule.manage) |manage| should_manage = manage;
+                }
+            }
+
+            if (!should_manage) continue;
+
+            // Observe window destruction
+            const wid_ptr: ?*anyopaque = @ptrFromInt(wid);
+            ax.observerAddNotification(observer, win_ref, ax.Notification.element_destroyed, wid_ptr) catch {};
+
+            // Track window at its current position
+            _ = c.c.CFRetain(win_ref);
+            self.windows.addWindow(.{
+                .id = wid,
+                .pid = pid,
+                .space_id = space_id,
+                .ax_ref = win_ref,
+            }) catch {
+                c.c.CFRelease(win_ref);
+                continue;
+            };
+
+            log.info("startup: tracked {s} wid={} on space {}", .{ app_name, wid, space_id });
+        }
+    }
+
+    /// Plan window moves based on rules (doesn't execute them)
+    fn planStartupMoves(self: *Self, moves: *[128]WindowMove) usize {
+        var count: usize = 0;
+        var it = self.windows.iterator();
+
+        while (it.next()) |entry| {
+            if (count >= moves.len) break;
+
+            const wid = entry.key_ptr.*;
+            const win = entry.value_ptr;
+            const current_space = win.space_id;
+
+            var app_name_buf: [256]u8 = undefined;
+            const name_len = c.c.proc_name(win.pid, &app_name_buf, 256);
+            const app_name: ?[]const u8 = if (name_len > 0) app_name_buf[0..@intCast(name_len)] else null;
+
+            if (app_name) |name| {
+                const rules = self.config.findMatchingRules(name, null, self.allocator) catch continue;
+                defer if (rules.len > 0) self.allocator.free(rules);
+
+                for (rules) |rule| {
+                    if (rule.space) |space_name| {
+                        if (self.resolveSpaceName(space_name)) |target_space| {
+                            if (target_space != current_space) {
+                                moves[count] = .{
+                                    .wid = wid,
+                                    .from_space = current_space,
+                                    .to_space = target_space,
+                                };
+                                count += 1;
+                                log.debug("plan: {s} wid={} from {} to {}", .{ name, wid, current_space, target_space });
+                                break; // First matching space rule wins
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return count;
+    }
+
+    /// Execute planned window moves
+    fn executeStartupMoves(self: *Self, moves: []const WindowMove) void {
+        for (moves) |m| {
+            if (self.moveWindowToSpaceInternal(m.wid, m.to_space)) {
+                self.windows.setWindowSpace(m.wid, m.to_space);
+                log.info("moved wid={} from {} to {}", .{ m.wid, m.from_space, m.to_space });
+            } else {
+                log.warn("failed to move wid={} to {}", .{ m.wid, m.to_space });
+            }
+        }
+    }
+
+    /// Switch each display to a space that has windows (or first space on that display)
+    fn switchToPopulatedSpaces(self: *Self) void {
+        const displays = Displays.getActiveDisplayList(self.allocator) catch return;
+        defer self.allocator.free(displays);
+
+        for (displays) |did| {
+            const current_sid = Display.getCurrentSpace(did) orelse continue;
+
+            // If current space has windows, keep it
+            if (self.windows.getWindowsForSpace(current_sid).len > 0) continue;
+
+            // Find a space on this display that has windows
+            const display_spaces = Display.getSpaceList(self.allocator, did) catch continue;
+            defer self.allocator.free(display_spaces);
+
+            for (display_spaces) |sid| {
+                if (self.windows.getWindowsForSpace(sid).len > 0) {
+                    log.info("switching display {} from space {} to {} (has windows)", .{ did, current_sid, sid });
+                    if (self.sa_client) |sa| {
+                        _ = sa.focusSpace(sid);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Layout only currently visible spaces
+    fn layoutVisibleSpaces(self: *Self) void {
+        const displays = Displays.getActiveDisplayList(self.allocator) catch return;
+        defer self.allocator.free(displays);
+
+        for (displays) |did| {
+            const sid = Display.getCurrentSpace(did) orelse continue;
+            const bounds = self.getBoundsForSpace(sid) orelse continue;
+            self.spaces.applyLayout(sid, bounds, &self.windows) catch |err| {
+                log.warn("layout failed for space {}: {}", .{ sid, err });
+            };
+        }
+
+        // Second pass after delay for stubborn windows
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+        for (displays) |did| {
+            const sid = Display.getCurrentSpace(did) orelse continue;
+            const bounds = self.getBoundsForSpace(sid) orelse continue;
+            self.spaces.applyLayout(sid, bounds, &self.windows) catch {};
+        }
     }
 
     /// Match physical displays to config labels (builtin/external)
@@ -1567,24 +2619,19 @@ pub const Daemon = struct {
         }
     }
 
-    /// Scan all running applications and set up observers
+    /// Runtime rescan of running applications (not startup)
+    /// Used when dirty.scan_apps is set (e.g., after system wake)
     fn scanRunningApplications(self: *Self) void {
         const workspace = @import("platform/workspace.zig");
         const pids = workspace.getRunningAppPids(self.allocator, self.pid) catch return;
         defer self.allocator.free(pids);
 
-        log.info("scanning {d} running applications", .{pids.len});
-
-        var tracked: usize = 0;
         for (pids) |pid| {
-            self.addApplicationWithPid(pid);
-            tracked += 1;
+            // Only add apps we don't already track
+            if (self.apps.getApplication(pid) == null) {
+                self.addApplicationWithPid(pid);
+            }
         }
-
-        log.info("tracked {d} applications", .{tracked});
-
-        // Apply layout to ALL spaces with windows (not just visible)
-        self.applyAllSpaceLayouts();
     }
 
     /// Apply layout to visible spaces (current space on each display)
@@ -1674,22 +2721,33 @@ pub const Daemon = struct {
         const app_name: ?[]const u8 = if (name_len > 0) app_name_buf[0..@intCast(name_len)] else null;
 
         // Get window list
-        const windows = Application.getWindowList(ax_ref) orelse return;
+        const windows = Application.getWindowList(ax_ref) orelse {
+            if (app_name) |name| log.debug("addApplicationWindows: {s} has no windows", .{name});
+            return;
+        };
         defer c.c.CFRelease(windows);
 
         const count: usize = @intCast(c.c.CFArrayGetCount(windows));
+        if (app_name) |name| log.debug("addApplicationWindows: {s} has {} windows", .{ name, count });
+
         for (0..count) |i| {
             const win_ref: c.AXUIElementRef = @ptrCast(@constCast(c.c.CFArrayGetValueAtIndex(windows, @intCast(i))));
             if (win_ref == null) continue;
 
             // Get window ID
-            const wid = Application.getWindowId(win_ref) orelse continue;
+            const wid = Application.getWindowId(win_ref) orelse {
+                if (app_name) |name| log.debug("addApplicationWindows: {s} window {} has no ID", .{ name, i });
+                continue;
+            };
 
             // Get the space this window is actually on
-            var space_id = Window.getSpace(wid);
-            if (space_id == 0) continue;
+            const space_id = Window.getSpace(wid);
+            if (space_id == 0) {
+                if (app_name) |name| log.debug("addApplicationWindows: {s} wid={} has space_id=0, skipping", .{ name, wid });
+                continue;
+            }
 
-            // Apply rules to determine if managed and target space
+            // Check if managed (rules check manage flag, but don't move during startup)
             var should_manage = self.shouldManageWindow(win_ref);
             if (app_name) |name| {
                 const rules = self.config.findMatchingRules(name, null, self.allocator) catch &[_]*const Config.AppRule{};
@@ -1707,7 +2765,9 @@ pub const Daemon = struct {
                             if (target_space != space_id) {
                                 if (self.moveWindowToSpaceInternal(wid, target_space)) {
                                     log.info("rule: moved {s} window {} to space {s}", .{ name, wid, space_name });
-                                    space_id = target_space;
+                                    // Mark both spaces dirty
+                                    self.dirty_spaces.mark(space_id);
+                                    self.dirty_spaces.mark(target_space);
                                 } else {
                                     log.warn("failed to move wid={} to space {s}", .{ wid, space_name });
                                 }
@@ -1841,6 +2901,9 @@ pub const Daemon = struct {
                 return;
             };
 
+            const span = trace.beginArgs("window_created", .window, .{ .wid = wid });
+            defer span.end();
+
             log.debug("window created notification: wid={d}", .{wid});
 
             // Get pid and app name for rule matching
@@ -1937,6 +3000,10 @@ pub const Daemon = struct {
         } else if (c.c.CFStringCompare(notification, destroyed, 0) == c.c.kCFCompareEqualTo) {
             // Window destroyed - get wid from refcon since element is now invalid
             const wid: u32 = @intCast(@intFromPtr(refcon));
+
+            const span = trace.beginArgs("window_destroyed", .window, .{ .wid = wid });
+            defer span.end();
+
             log.debug("window destroyed notification: wid={d} (from refcon)", .{wid});
 
             if (wid == 0) return;
@@ -1948,37 +3015,42 @@ pub const Daemon = struct {
                 self.getCurrentSpaceId() orelse return;
 
             _ = self.windows.removeWindow(wid);
-            self.applyLayoutToSpace(space_id);
+            self.dirty_spaces.mark(space_id);
             log.debug("window destroyed: wid={d} removed", .{wid});
         } else if (c.c.CFStringCompare(notification, minimized, 0) == c.c.kCFCompareEqualTo) {
             // Window minimized - update flag (layout will exclude it)
             const wid = Application.getWindowId(element) orelse return;
 
+            trace.instant("window_minimized", .window, .{ .wid = wid });
+
             // Update minimized flag in Windows
             self.windows.setMinimized(wid, true);
 
-            // Apply layout (minimized windows will be excluded by getTileableWindowsForSpace)
-            self.applyCurrentLayout();
+            // Mark layout as dirty
+            self.dirty.layout_current = true;
 
             log.debug("window minimized: wid={d}", .{wid});
         } else if (c.c.CFStringCompare(notification, deminimized, 0) == c.c.kCFCompareEqualTo) {
             // Window deminimized - update flag and re-layout
             const wid = Application.getWindowId(element) orelse return;
 
+            trace.instant("window_deminimized", .window, .{ .wid = wid });
+
             if (!self.shouldManageWindow(element)) return;
 
             // Update minimized flag in Windows
             self.windows.setMinimized(wid, false);
 
-            // Get current space from Windows
+            // Get current space from Windows and mark dirty
             const space_id = self.windows.getWindowSpace(wid) orelse self.getCurrentSpaceId() orelse return;
-
-            self.applyLayoutToSpace(space_id);
+            self.dirty_spaces.mark(space_id);
 
             log.debug("window deminimized: wid={d} space={d}", .{ wid, space_id });
         } else if (c.c.CFStringCompare(notification, focus_changed, 0) == c.c.kCFCompareEqualTo) {
             // Window focus changed - update tracking and handle mouse warp
             const wid = Application.getWindowId(element) orelse return;
+
+            trace.instant("window_focus", .window, .{ .wid = wid });
 
             // Update focused window tracking
             self.windows.setFocused(wid);
@@ -2010,6 +3082,12 @@ pub const Daemon = struct {
             if (Application.getFocusedWindow(app.ax_ref)) |win_ref| {
                 defer c.c.CFRelease(win_ref);
                 if (Application.getWindowId(win_ref)) |wid| {
+                    // Check if this window is tracked
+                    if (self.windows.getWindow(wid) == null) {
+                        // Untracked window - try to track it now
+                        self.trackNewWindow(pid, wid, win_ref);
+                    }
+
                     // Update tracking
                     self.windows.setFocused(wid);
 
@@ -2034,10 +3112,83 @@ pub const Daemon = struct {
         log.debug("app front switched: pid={d} (not tracked or no window)", .{pid});
     }
 
+    /// Track a newly discovered window (missed during initial scan)
+    fn trackNewWindow(self: *Self, pid: c.pid_t, wid: Window.Id, win_ref: c.AXUIElementRef) void {
+        // Get app name for rule matching
+        var app_name_buf: [256]u8 = undefined;
+        const name_len = c.c.proc_name(pid, &app_name_buf, 256);
+        const app_name: ?[]const u8 = if (name_len > 0) app_name_buf[0..@intCast(name_len)] else null;
+
+        // Get window's current space
+        var space_id = Window.getSpace(wid);
+        if (space_id == 0) space_id = self.getCurrentSpaceId() orelse return;
+
+        // Check if managed
+        var should_manage = self.shouldManageWindow(win_ref);
+        if (app_name) |name| {
+            const rules = self.config.findMatchingRules(name, null, self.allocator) catch &[_]*const Config.AppRule{};
+            defer if (rules.len > 0) self.allocator.free(rules);
+
+            for (rules) |rule| {
+                if (rule.manage) |manage| {
+                    should_manage = manage;
+                }
+
+                // Apply space rule
+                if (rule.space) |space_name| {
+                    if (self.resolveSpaceName(space_name)) |target_space| {
+                        if (target_space != space_id) {
+                            if (self.moveWindowToSpaceInternal(wid, target_space)) {
+                                log.info("rule: moved late {s} window {} to space {s}", .{ name, wid, space_name });
+                                self.windows.setWindowSpace(wid, target_space);
+                                self.dirty_spaces.mark(space_id);
+                                self.dirty_spaces.mark(target_space);
+                                space_id = target_space;
+                            }
+                        }
+                    }
+                }
+
+                if (rule.opacity) |opacity| {
+                    Window.setOpacity(wid, opacity) catch {};
+                }
+
+                if (rule.layer) |layer| {
+                    const level: i32 = switch (layer) {
+                        .below => self.layer_below,
+                        .normal => self.layer_normal,
+                        .above => self.layer_above,
+                    };
+                    Window.setLevel(wid, level) catch {};
+                }
+            }
+        }
+
+        if (!should_manage) {
+            log.debug("trackNewWindow: {s} wid={} not managed", .{ app_name orelse "unknown", wid });
+            return;
+        }
+
+        // Track it
+        _ = c.c.CFRetain(win_ref);
+        self.windows.addWindow(.{
+            .id = wid,
+            .pid = pid,
+            .space_id = space_id,
+            .ax_ref = win_ref,
+        }) catch {
+            c.c.CFRelease(win_ref);
+            return;
+        };
+
+        log.info("trackNewWindow: late-tracked {s} wid={} on space {}", .{ app_name orelse "unknown", wid, space_id });
+        self.dirty_spaces.mark(space_id);
+    }
+
     /// Handle application launched event
     pub fn handleApplicationLaunched(self: *Self, pid: c.pid_t) void {
         self.addApplicationWithPid(pid);
-        self.applyCurrentLayout();
+        self.dirty.layout_current = true;
     }
 
     /// Handle application terminated event
@@ -2051,56 +3202,61 @@ pub const Daemon = struct {
         // Remove app from tracking
         self.removeApplicationWithPid(pid);
 
-        // Apply layout to current space
-        self.applyCurrentLayout();
+        // Mark layout as dirty
+        self.dirty.layout_current = true;
     }
 
     /// Handle application hidden event - mark windows as hidden for layout exclusion
     fn handleApplicationHidden(self: *Self, pid: c.pid_t) void {
         // Mark all windows for this PID as hidden
-        var it = self.windows.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.pid == pid) {
-                entry.value_ptr.flags.hidden = true;
-            }
+        const windows = self.windows.getWindowsForPid(pid);
+        for (windows) |wid| {
+            self.windows.setHidden(wid, true);
         }
-        self.applyCurrentLayout();
+        self.dirty.layout_current = true;
     }
 
     /// Handle application visible event - mark windows as visible and re-layout
     fn handleApplicationVisible(self: *Self, pid: c.pid_t) void {
         // Mark all windows for this PID as visible
-        var it = self.windows.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.pid == pid) {
-                entry.value_ptr.flags.hidden = false;
-            }
+        const windows = self.windows.getWindowsForPid(pid);
+        for (windows) |wid| {
+            self.windows.setHidden(wid, false);
         }
-        self.applyCurrentLayout();
+        self.dirty.layout_current = true;
     }
 
     /// Handle space changed event - switch to new space's layout
     fn handleSpaceChanged(self: *Self) void {
+        const new_sid = self.getCurrentSpaceId() orelse return;
+        const old_sid = self.spaces.current_space_id;
+
         // Update current space tracking
-        if (self.getCurrentSpaceId()) |sid| {
-            self.spaces.setCurrentSpace(sid);
+        self.spaces.setCurrentSpace(new_sid);
+
+        // Skip layout if returning to same space (no windows changed)
+        if (old_sid == new_sid) {
+            log.debug("space changed: same space {}, skipping layout", .{new_sid});
+            return;
         }
-        // Apply layout for the now-visible space
-        self.applyCurrentLayout();
+
+        // Mark current space as needing layout
+        self.dirty.layout_current = true;
     }
 
     /// Handle active display changed event (focus moved between displays)
     /// Note: This is NOT for display add/remove - that's handled by displayReconfigurationCallback
     fn handleDisplayChanged(self: *Self) void {
-        // Just reapply layout for the current space on the now-active display
-        self.applyCurrentLayout();
+        // No-op: active display change doesn't need relayout
+        // Display reconfiguration (add/remove) is handled separately
+        _ = self;
     }
 
     /// Handle system wake event - rescan and rebuild everything
     fn handleSystemWoke(self: *Self) void {
         // After wake, windows may have moved or apps may have changed state
-        // Do a full rescan
-        self.scanRunningApplications();
+        self.dirty.scan_apps = true;
+        self.dirty.layout_all = true;
     }
 };
 

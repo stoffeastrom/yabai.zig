@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("platform/c.zig");
 const skylight = @import("platform/skylight.zig");
 const Daemon = @import("Daemon.zig").Daemon;
+const trace = @import("trace/Tracer.zig");
 // Core types
 pub const geometry = @import("core/geometry.zig");
 pub const Window = @import("core/Window.zig");
@@ -42,6 +43,7 @@ pub const Response = @import("ipc/Response.zig");
 
 // SA pattern extraction (used for auto-discovery at daemon startup)
 pub const sa_extractor = @import("sa/extractor.zig");
+pub const sa_injector = @import("sa/injector.zig");
 
 const log = std.log.scoped(.yabai);
 
@@ -92,6 +94,7 @@ pub const MAXLEN = 512;
 const Args = struct {
     verbose: bool = false,
     config_file: [4096]u8 = undefined,
+    timeout_ms: ?u64 = null,
 };
 
 var g: Args = .{};
@@ -116,8 +119,12 @@ fn printUsage() void {
         \\    --start-service        Enable, load, and start the launchd service.
         \\    --restart-service      Attempts to restart the service instance.
         \\    --stop-service         Stops a running instance of the service.
+        \\    --load-sa              Install and load scripting addition (requires sudo).
+        \\    --unload-sa            Unload and remove scripting addition (requires sudo).
+        \\    --install-sudoers      Add sudoers entry for passwordless --load-sa.
         \\    --message, -m <msg>    Send message to a running instance of yabai.zig.
         \\    --config, -c <config>  Use the specified configuration file.
+        \\    --timeout <ms>         Exit after specified milliseconds (for testing).
         \\    --debug                Skip accessibility check (for development).
         \\    --verbose, -V          Output debug information to stdout.
         \\    --check-sa [path]      Analyze binary for SA patterns (default: Dock).
@@ -285,6 +292,19 @@ pub fn main() !u8 {
         return checkSA(allocator, binary_path);
     }
 
+    // SA loading (requires root)
+    if (std.mem.eql(u8, opt, "--load-sa")) {
+        return loadSA();
+    }
+    if (std.mem.eql(u8, opt, "--unload-sa")) {
+        return unloadSA();
+    }
+
+    // Sudoers setup for passwordless SA loading
+    if (std.mem.eql(u8, opt, "--install-sudoers")) {
+        return installSudoers();
+    }
+
     // Parse remaining options for daemon mode
     var i: usize = 1;
     var skip_checks = false;
@@ -294,6 +314,16 @@ pub fn main() !u8 {
             g.verbose = true;
         } else if (std.mem.eql(u8, arg, "--debug")) {
             skip_checks = true;
+        } else if (std.mem.eql(u8, arg, "--timeout")) {
+            i += 1;
+            if (i >= args.len) {
+                getStderr().writeAll("yabai.zig: option '--timeout' requires an argument!\n") catch {};
+                return 1;
+            }
+            g.timeout_ms = std.fmt.parseInt(u64, args[i], 10) catch {
+                getStderr().writeAll("yabai.zig: invalid timeout value!\n") catch {};
+                return 1;
+            };
         } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
             i += 1;
             if (i >= args.len) {
@@ -314,6 +344,12 @@ pub fn main() !u8 {
             getStderr().writeAll(msg) catch {};
             return 1;
         }
+    }
+
+    // --timeout requires --debug
+    if (g.timeout_ms != null and !skip_checks) {
+        getStderr().writeAll("yabai.zig: --timeout requires --debug\n") catch {};
+        return 1;
     }
 
     return startDaemon(skip_checks);
@@ -761,10 +797,418 @@ fn checkSA(allocator: std.mem.Allocator, binary_path: []const u8) u8 {
     return if (result.foundCount() == 7) 0 else 1;
 }
 
+// =============================================================================
+// Scripting Addition (SA) management
+// =============================================================================
+
+const SA_OSAX_PATH = "/Library/ScriptingAdditions/yabai.zig.osax";
+const SA_PAYLOAD_PATH = SA_OSAX_PATH ++ "/Contents/MacOS/payload";
+
+fn loadSA() u8 {
+    const stdout = getStdout();
+    const stderr = getStderr();
+
+    // Check if running as root
+    if (std.c.getuid() != 0) {
+        stderr.writeAll("yabai.zig: scripting-addition must be loaded as root!\n") catch {};
+        stderr.writeAll("Run: sudo yabai.zig --load-sa\n") catch {};
+        return 1;
+    }
+
+    // Check SIP status
+    if (!checkSIPStatus()) {
+        stderr.writeAll("yabai.zig: System Integrity Protection must have Debugging Restrictions disabled!\n") catch {};
+        return 1;
+    }
+
+    // Install SA if needed
+    if (!installSAFiles()) {
+        stderr.writeAll("yabai.zig: failed to install scripting-addition files\n") catch {};
+        return 1;
+    }
+
+    // Check if already injected
+    if (sa_injector.isAlreadyInjected()) {
+        stdout.writeAll("yabai.zig: scripting-addition already loaded\n") catch {};
+        return 0;
+    }
+
+    // Get Dock PID
+    const dock_pid = workspace.getDockPid();
+    if (dock_pid == 0) {
+        stderr.writeAll("yabai.zig: could not find Dock.app\n") catch {};
+        return 1;
+    }
+
+    var msg_buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "yabai.zig: injecting SA into Dock (pid={})\n", .{dock_pid}) catch "yabai.zig: injecting SA into Dock\n";
+    stdout.writeAll(msg) catch {};
+
+    // Find our loader binary (next to this executable)
+    var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_path = std.fs.selfExePath(&exe_path_buf) catch {
+        stderr.writeAll("yabai.zig: could not determine executable path\n") catch {};
+        return 1;
+    };
+
+    // Get directory of executable
+    const exe_dir = std.fs.path.dirname(exe_path) orelse {
+        stderr.writeAll("yabai.zig: could not determine executable directory\n") catch {};
+        return 1;
+    };
+
+    // Build loader path
+    var loader_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const loader_path = std.fmt.bufPrint(&loader_path_buf, "{s}/yabai.zig-sa-loader", .{exe_dir}) catch {
+        stderr.writeAll("yabai.zig: path buffer overflow\n") catch {};
+        return 1;
+    };
+
+    // Check loader exists
+    std.fs.accessAbsolute(loader_path, .{}) catch {
+        stderr.writeAll("yabai.zig: loader binary not found at ") catch {};
+        stderr.writeAll(loader_path) catch {};
+        stderr.writeAll("\n") catch {};
+        return 1;
+    };
+
+    // Build pid string
+    var pid_buf: [16]u8 = undefined;
+    const pid_str = std.fmt.bufPrint(&pid_buf, "{}", .{dock_pid}) catch {
+        stderr.writeAll("yabai.zig: pid format error\n") catch {};
+        return 1;
+    };
+
+    // Run loader: yabai.zig-sa-loader <pid> <payload_path>
+    var child = std.process.Child.init(&.{ loader_path, pid_str, SA_PAYLOAD_PATH }, std.heap.page_allocator);
+    child.spawn() catch {
+        stderr.writeAll("yabai.zig: failed to spawn loader\n") catch {};
+        return 1;
+    };
+
+    const term = child.wait() catch {
+        stderr.writeAll("yabai.zig: failed to wait for loader\n") catch {};
+        return 1;
+    };
+
+    if (term.Exited == 0) {
+        stdout.writeAll("yabai.zig: scripting-addition loaded successfully\n") catch {};
+        return 0;
+    } else {
+        var err_buf: [256]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&err_buf, "yabai.zig: loader exited with code {}\n", .{term.Exited}) catch "yabai.zig: loader failed\n";
+        stderr.writeAll(err_msg) catch {};
+        return 1;
+    }
+}
+
+fn unloadSA() u8 {
+    const stdout = getStdout();
+    const stderr = getStderr();
+
+    // Check if running as root
+    if (std.c.getuid() != 0) {
+        stderr.writeAll("yabai.zig: scripting-addition must be unloaded as root!\n") catch {};
+        stderr.writeAll("Run: sudo yabai.zig --unload-sa\n") catch {};
+        return 1;
+    }
+
+    // Remove SA directory
+    std.fs.deleteTreeAbsolute(SA_OSAX_PATH) catch |err| {
+        if (err != error.FileNotFound) {
+            var err_buf: [256]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "yabai.zig: failed to remove {s}: {}\n", .{ SA_OSAX_PATH, err }) catch "yabai.zig: failed to remove SA\n";
+            stderr.writeAll(err_msg) catch {};
+            return 1;
+        }
+    };
+
+    stdout.writeAll("yabai.zig: scripting-addition unloaded (Dock restart required)\n") catch {};
+    stdout.writeAll("Run: killall Dock\n") catch {};
+    return 0;
+}
+
+fn installSudoers() u8 {
+    const stdout = getStdout();
+    const stderr = getStderr();
+
+    const user = std.posix.getenv("USER") orelse {
+        stderr.writeAll("yabai.zig: USER not set\n") catch {};
+        return 1;
+    };
+
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_path = std.fs.selfExePath(&exe_buf) catch {
+        stderr.writeAll("yabai.zig: cannot determine executable path\n") catch {};
+        return 1;
+    };
+
+    // Create sudoers entry: user ALL=(root) NOPASSWD: sha256:HASH /path/to/yabai.zig --load-sa
+    // Using sha256 hash ensures only this exact binary can run without password
+    var hash_buf: [128]u8 = undefined;
+    const hash = getSha256Hash(exe_path, &hash_buf) orelse {
+        stderr.writeAll("yabai.zig: failed to compute binary hash\n") catch {};
+        return 1;
+    };
+
+    var entry_buf: [1024]u8 = undefined;
+    const entry = std.fmt.bufPrint(&entry_buf, "{s} ALL=(root) NOPASSWD: sha256:{s} {s} --load-sa\n", .{ user, hash, exe_path }) catch {
+        stderr.writeAll("yabai.zig: path too long\n") catch {};
+        return 1;
+    };
+
+    // Write to temp file
+    const tmp_path = "/tmp/yabai-zig-sudoers";
+    const tmp_file = std.fs.createFileAbsolute(tmp_path, .{}) catch {
+        stderr.writeAll("yabai.zig: failed to create temp file\n") catch {};
+        return 1;
+    };
+    tmp_file.writeAll(entry) catch {
+        tmp_file.close();
+        stderr.writeAll("yabai.zig: failed to write sudoers entry\n") catch {};
+        return 1;
+    };
+    tmp_file.close();
+
+    // Use visudo to validate and install
+    stdout.writeAll("yabai.zig: validating sudoers entry with visudo...\n") catch {};
+
+    var script_buf: [2048]u8 = undefined;
+    const script = std.fmt.bufPrint(&script_buf,
+        \\do shell script "visudo -c -f {s} && cp {s} /etc/sudoers.d/yabai-zig && chmod 440 /etc/sudoers.d/yabai-zig" with administrator privileges
+    , .{ tmp_path, tmp_path }) catch {
+        stderr.writeAll("yabai.zig: script too long\n") catch {};
+        return 1;
+    };
+
+    var child = std.process.Child.init(&.{ "/usr/bin/osascript", "-e", script }, std.heap.page_allocator);
+    child.spawn() catch {
+        stderr.writeAll("yabai.zig: failed to run visudo\n") catch {};
+        return 1;
+    };
+
+    const term = child.wait() catch {
+        stderr.writeAll("yabai.zig: visudo wait failed\n") catch {};
+        return 1;
+    };
+
+    // Clean up temp file
+    std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    if (term.Exited == 0) {
+        stdout.writeAll("yabai.zig: sudoers entry installed - --load-sa will no longer require password\n") catch {};
+        return 0;
+    } else {
+        stderr.writeAll("yabai.zig: failed to install sudoers entry (cancelled or invalid)\n") catch {};
+        return 1;
+    }
+}
+
+fn getSha256Hash(path: []const u8, out: []u8) ?[]const u8 {
+    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    defer file.close();
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buf: [8192]u8 = undefined;
+
+    while (true) {
+        const n = file.read(&buf) catch return null;
+        if (n == 0) break;
+        hasher.update(buf[0..n]);
+    }
+
+    const digest = hasher.finalResult();
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    if (out.len < hex.len) return null;
+    @memcpy(out[0..hex.len], &hex);
+    return out[0..hex.len];
+}
+
+fn checkSIPStatus() bool {
+    // Check csrutil status - we need Debugging Restrictions disabled
+    var child = std.process.Child.init(&.{ "/usr/bin/csrutil", "status" }, std.heap.page_allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+
+    child.spawn() catch return false;
+
+    var output_buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    if (child.stdout) |stdout| {
+        while (total < output_buf.len) {
+            const n = stdout.read(output_buf[total..]) catch break;
+            if (n == 0) break;
+            total += n;
+        }
+    }
+
+    // Don't wait - may panic due to SIGCHLD handling
+    // Just check output for what we need
+    const output = output_buf[0..total];
+
+    // Look for "Debugging Restrictions: disabled"
+    if (std.mem.indexOf(u8, output, "Debugging Restrictions: disabled") != null) {
+        return true;
+    }
+
+    // Also accept "System Integrity Protection status: disabled"
+    if (std.mem.indexOf(u8, output, "status: disabled") != null) {
+        return true;
+    }
+
+    return false;
+}
+
+fn installSAFiles() bool {
+    // Build path to payload dylib (relative to executable)
+    var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_path = std.fs.selfExePath(&exe_path_buf) catch return false;
+    const exe_dir = std.fs.path.dirname(exe_path) orelse return false;
+
+    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_path = std.fmt.bufPrint(&src_path_buf, "{s}/../lib/libyabai.zig-sa.dylib", .{exe_dir}) catch return false;
+
+    // Check source exists
+    std.fs.accessAbsolute(src_path, .{}) catch {
+        var err_buf: [512]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&err_buf, "yabai.zig: payload not found at {s}\n", .{src_path}) catch "yabai.zig: payload not found\n";
+        getStderr().writeAll(err_msg) catch {};
+        return false;
+    };
+
+    // Create directory structure
+    std.fs.makeDirAbsolute(SA_OSAX_PATH) catch |err| {
+        if (err != error.PathAlreadyExists) {
+            var err_buf: [256]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "yabai.zig: failed to create {s}: {}\n", .{ SA_OSAX_PATH, err }) catch "yabai.zig: failed to create SA dir\n";
+            getStderr().writeAll(err_msg) catch {};
+            return false;
+        }
+    };
+
+    const contents_macos = SA_OSAX_PATH ++ "/Contents/MacOS";
+    std.fs.makeDirAbsolute(SA_OSAX_PATH ++ "/Contents") catch |err| {
+        if (err != error.PathAlreadyExists) return false;
+    };
+    std.fs.makeDirAbsolute(contents_macos) catch |err| {
+        if (err != error.PathAlreadyExists) return false;
+    };
+
+    // Copy payload
+    std.fs.copyFileAbsolute(src_path, SA_PAYLOAD_PATH, .{}) catch |err| {
+        var err_buf: [256]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&err_buf, "yabai.zig: failed to copy payload: {}\n", .{err}) catch "yabai.zig: failed to copy payload\n";
+        getStderr().writeAll(err_msg) catch {};
+        return false;
+    };
+
+    // Make executable
+    const file = std.fs.openFileAbsolute(SA_PAYLOAD_PATH, .{ .mode = .read_write }) catch return false;
+    defer file.close();
+    file.chmod(0o755) catch return false;
+
+    var msg_buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "yabai.zig: installed SA to {s}\n", .{SA_OSAX_PATH}) catch "yabai.zig: installed SA\n";
+    getStdout().writeAll(msg) catch {};
+    return true;
+}
+
+/// Check if SA is available (socket exists)
+fn checkSAAvailable() bool {
+    const user = std.posix.getenv("USER") orelse return false;
+    var path_buf: [128]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/tmp/yabai.zig-sa_{s}.socket", .{user}) catch return false;
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
+}
+
+/// Initialize SA - load if needed with GUI sudo prompt
+fn initSA() void {
+    if (checkSAAvailable()) {
+        log.info("SA: loaded", .{});
+        return;
+    }
+
+    // Get our executable path
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_path = std.fs.selfExePath(&exe_buf) catch {
+        log.warn("SA: cannot determine executable path", .{});
+        return;
+    };
+
+    // Check if payload exists (either installed or in dev location)
+    const payload_exists = blk: {
+        std.fs.accessAbsolute(SA_PAYLOAD_PATH, .{}) catch {
+            // Check dev location
+            const exe_dir = std.fs.path.dirname(exe_path) orelse break :blk false;
+            var dev_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const dev_path = std.fmt.bufPrint(&dev_path_buf, "{s}/../lib/libyabai.zig-sa.dylib", .{exe_dir}) catch break :blk false;
+            std.fs.accessAbsolute(dev_path, .{}) catch break :blk false;
+            break :blk true;
+        };
+        break :blk true;
+    };
+
+    if (!payload_exists) {
+        log.info("SA: payload not found, space management disabled", .{});
+        return;
+    }
+
+    log.info("SA: not loaded, requesting authorization...", .{});
+
+    // Use osascript to run with admin privileges (shows GUI prompt)
+    var script_buf: [1024]u8 = undefined;
+    const script = std.fmt.bufPrint(&script_buf, "do shell script \"{s} --load-sa\" with administrator privileges", .{exe_path}) catch {
+        log.warn("SA: script too long", .{});
+        return;
+    };
+
+    var child = std.process.Child.init(&.{ "/usr/bin/osascript", "-e", script }, std.heap.page_allocator);
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch |err| {
+        log.warn("SA: failed to spawn osascript: {}", .{err});
+        return;
+    };
+
+    // Read stderr for error messages
+    var err_buf: [512]u8 = undefined;
+    var err_len: usize = 0;
+    if (child.stderr) |stderr| {
+        err_len = stderr.read(&err_buf) catch 0;
+    }
+
+    // Wait for completion (user may cancel)
+    const term = child.wait() catch {
+        log.warn("SA: osascript wait failed", .{});
+        return;
+    };
+
+    if (term.Exited == 0) {
+        log.info("SA: loaded successfully", .{});
+    } else {
+        if (err_len > 0) {
+            // User cancelled or auth failed
+            const err_msg = std.mem.trim(u8, err_buf[0..err_len], " \t\n\r");
+            if (std.mem.indexOf(u8, err_msg, "User canceled") != null) {
+                log.info("SA: authorization cancelled by user", .{});
+            } else {
+                log.warn("SA: load failed: {s}", .{err_msg});
+            }
+        } else {
+            log.warn("SA: load failed (exit {})", .{term.Exited});
+        }
+    }
+}
+
 fn startDaemon(skip_checks: bool) u8 {
     // Open log file for debugging
     log_file = std.fs.createFileAbsolute("/tmp/yabai.zig.log", .{ .truncate = true }) catch null;
     defer if (log_file) |f| f.close();
+
+    // Initialize tracing (for Perfetto)
+    trace.init();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -823,8 +1267,13 @@ fn startDaemon(skip_checks: bool) u8 {
 
     log.info("yabai.zig {s} started", .{Version.string()});
 
-    // Run the main event loop (blocks until stopped)
-    daemon.run();
+    // Run the main event loop (blocks until stopped or timeout)
+    if (g.timeout_ms) |timeout| {
+        log.info("debug: will exit after {}ms", .{timeout});
+        daemon.runWithTimeout(timeout);
+    } else {
+        daemon.run();
+    }
 
     return 0;
 }
@@ -875,4 +1324,7 @@ test {
 
     // SA
     _ = sa_extractor;
+
+    // Tracing
+    _ = trace;
 }

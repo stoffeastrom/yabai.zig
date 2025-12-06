@@ -6,25 +6,36 @@ const c = @import("../platform/c.zig");
 
 const Hotload = @This();
 
-config_path: []const u8,
+const max_path_len = 1024;
+
+config_path_buf: [max_path_len]u8,
+config_path_len: usize,
 callback: *const fn () void,
 stream: c.c.FSEventStreamRef,
 
 // Global context - only one hotload watcher supported at a time
 var g_context: struct {
-    path: []const u8 = "",
+    path_buf: [max_path_len]u8 = undefined,
+    path_len: usize = 0,
     callback: *const fn () void = undefined,
+
+    fn getPath(self: *const @This()) []const u8 {
+        return self.path_buf[0..self.path_len];
+    }
 } = .{};
 
 /// Initialize hotload watcher for config file
 /// Returns null if FSEvents stream cannot be created
 pub fn init(config_path: []const u8, callback: *const fn () void) ?Hotload {
+    if (config_path.len > max_path_len) return null;
+
     // Extract directory from path
     const dir_end = std.mem.lastIndexOfScalar(u8, config_path, '/') orelse return null;
     const config_dir = config_path[0 .. dir_end + 1];
 
-    // Store in global context for callback
-    g_context.path = config_path;
+    // Store in global context for callback (copy the path)
+    g_context.path_len = config_path.len;
+    @memcpy(g_context.path_buf[0..config_path.len], config_path);
     g_context.callback = callback;
 
     // Create CFString for directory path
@@ -66,11 +77,14 @@ pub fn init(config_path: []const u8, callback: *const fn () void) ?Hotload {
         c.c.kFSEventStreamCreateFlagFileEvents | c.c.kFSEventStreamCreateFlagNoDefer,
     ) orelse return null;
 
-    return Hotload{
-        .config_path = config_path,
+    var hotload = Hotload{
+        .config_path_buf = undefined,
+        .config_path_len = config_path.len,
         .callback = callback,
         .stream = stream,
     };
+    @memcpy(hotload.config_path_buf[0..config_path.len], config_path);
+    return hotload;
 }
 
 /// Start watching for file changes
@@ -119,7 +133,7 @@ fn fseventsCallback(
         if (dominated != 0) {
             // Match exact config path
             const event_path = std.mem.span(paths[i]);
-            if (std.mem.eql(u8, event_path, g_context.path)) {
+            if (std.mem.eql(u8, event_path, g_context.getPath())) {
                 g_context.callback();
                 return; // Only trigger once per batch
             }
@@ -151,11 +165,11 @@ test "init stores config path" {
     const dummy_callback = struct {
         fn cb() void {}
     }.cb;
-    const hotload = Hotload.init("/tmp/test/yabairc", dummy_callback);
+    const hotload = Hotload.init("/tmp/test/config", dummy_callback);
     if (hotload) |h| {
         var hl = h;
         defer hl.deinit();
-        try std.testing.expectEqualStrings("/tmp/test/yabairc", hl.config_path);
+        try std.testing.expectEqualStrings("/tmp/test/config", hl.config_path_buf[0..hl.config_path_len]);
     }
 }
 
@@ -163,7 +177,7 @@ test "init creates valid stream" {
     const dummy_callback = struct {
         fn cb() void {}
     }.cb;
-    const hotload = Hotload.init("/tmp/yabairc", dummy_callback);
+    const hotload = Hotload.init("/tmp/config", dummy_callback);
     if (hotload) |h| {
         var hl = h;
         try std.testing.expect(hl.stream != null);
@@ -176,7 +190,7 @@ test "start and deinit lifecycle" {
     const dummy_callback = struct {
         fn cb() void {}
     }.cb;
-    var hotload = Hotload.init("/tmp/yabairc", dummy_callback) orelse return;
+    var hotload = Hotload.init("/tmp/config", dummy_callback) orelse return;
     defer hotload.deinit();
 
     hotload.start();
@@ -200,7 +214,7 @@ test "integration: file modification triggers callback" {
     };
     defer std.fs.deleteTreeAbsolute(test_dir) catch {};
 
-    const config_path = test_dir ++ "/yabairc";
+    const config_path = test_dir ++ "/config";
 
     // Create initial file
     {
@@ -250,7 +264,7 @@ test "integration: non-config file does not trigger callback" {
     };
     defer std.fs.deleteTreeAbsolute(test_dir) catch {};
 
-    const config_path = test_dir ++ "/yabairc";
+    const config_path = test_dir ++ "/config";
 
     // Create config file (we watch its directory)
     {

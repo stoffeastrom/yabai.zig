@@ -887,7 +887,7 @@ test "integration: discover functions from Dock" {
 
     // Run discovery
     const discovery = discoverFunctions(allocator, binary_data) catch |err| {
-        std.debug.print("Discovery error: {}\n", .{err});
+        std.log.err("Discovery error: {}", .{err});
         try std.testing.expect(false);
         return;
     };
@@ -895,7 +895,7 @@ test "integration: discover functions from Dock" {
     // Should find at least the ObjC selector-based functions
     // (add_space, remove_space, move_space)
     const found = discovery.foundCount();
-    std.debug.print("\nIntegration test: discovered {}/7 functions\n", .{found});
+    std.log.info("Integration test: discovered {}/7 functions", .{found});
 
     // We expect at least 3 functions (the ObjC ones) on any macOS version
     try std.testing.expect(found >= 3);

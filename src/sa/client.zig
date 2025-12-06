@@ -25,36 +25,68 @@ pub const Opcode = enum(u8) {
     window_order_in = 0x11,
     window_list_to_space = 0x12,
     window_to_space = 0x13,
+    configure = 0x20, // Send discovered function addresses to payload
 };
 
 /// SA client for communicating with the injected payload
 pub const Client = struct {
-    socket_path: []const u8,
+    socket_path_buf: [256]u8,
+    socket_path_len: usize,
 
     pub fn init(socket_path: []const u8) Client {
-        return .{ .socket_path = socket_path };
+        var client = Client{
+            .socket_path_buf = undefined,
+            .socket_path_len = @min(socket_path.len, 255),
+        };
+        @memcpy(client.socket_path_buf[0..client.socket_path_len], socket_path[0..client.socket_path_len]);
+        client.socket_path_buf[client.socket_path_len] = 0;
+        return client;
+    }
+
+    fn getSocketPath(self: *const Client) []const u8 {
+        return self.socket_path_buf[0..self.socket_path_len];
     }
 
     /// Send a message to the SA and wait for acknowledgment
     fn send(self: *const Client, bytes: []const u8) bool {
+        const socket_path = self.getSocketPath();
+        log.debug("SA send: path={s} (len={})", .{ socket_path, socket_path.len });
+
         // Create socket
-        const sockfd = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch return false;
+        const sockfd = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch |err| {
+            log.debug("SA send: socket create failed: {}", .{err});
+            return false;
+        };
         defer std.posix.close(sockfd);
+
+        // Set socket timeout (500ms for connect/send/recv)
+        const timeout = std.posix.timeval{ .sec = 0, .usec = 500_000 };
+        std.posix.setsockopt(sockfd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+        std.posix.setsockopt(sockfd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
 
         // Connect to SA socket
         var addr: std.posix.sockaddr.un = .{ .family = std.posix.AF.UNIX, .path = undefined };
         @memset(&addr.path, 0);
-        const path_len = @min(self.socket_path.len, addr.path.len - 1);
-        @memcpy(addr.path[0..path_len], self.socket_path[0..path_len]);
+        const path_len = @min(socket_path.len, addr.path.len - 1);
+        @memcpy(addr.path[0..path_len], socket_path[0..path_len]);
 
-        std.posix.connect(sockfd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) catch return false;
+        std.posix.connect(sockfd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) catch |err| {
+            log.debug("SA send: connect failed: {} (path={s})", .{ err, socket_path });
+            return false;
+        };
 
         // Send message
-        _ = std.posix.send(sockfd, bytes, 0) catch return false;
+        _ = std.posix.send(sockfd, bytes, 0) catch |err| {
+            log.debug("SA send: send failed: {}", .{err});
+            return false;
+        };
 
         // Wait for ack (single byte)
         var ack: [1]u8 = undefined;
-        _ = std.posix.recv(sockfd, &ack, 0) catch return false;
+        _ = std.posix.recv(sockfd, &ack, 0) catch |err| {
+            log.debug("SA send: recv failed: {}", .{err});
+            return false;
+        };
 
         return true;
     }
@@ -75,6 +107,27 @@ pub const Client = struct {
         }
 
         return self.send(buf[0..total_len]);
+    }
+
+    // ========================================================================
+    // Configuration - send discovered addresses to payload
+    // ========================================================================
+
+    /// Configure payload with discovered function addresses
+    /// Called once after injection to provide runtime-discovered Dock internals
+    pub fn configure(self: *const Client, dock_spaces: u64, add_space: u64, remove_space: u64, move_space: u64) bool {
+        var payload: [32]u8 = undefined;
+        std.mem.writeInt(u64, payload[0..8], dock_spaces, .little);
+        std.mem.writeInt(u64, payload[8..16], add_space, .little);
+        std.mem.writeInt(u64, payload[16..24], remove_space, .little);
+        std.mem.writeInt(u64, payload[24..32], move_space, .little);
+        const result = self.sendMessage(.configure, &payload);
+        if (result) {
+            log.info("configured payload with addresses: dock_spaces=0x{x} add=0x{x} remove=0x{x} move=0x{x}", .{ dock_spaces, add_space, remove_space, move_space });
+        } else {
+            log.warn("failed to configure payload", .{});
+        }
+        return result;
     }
 
     // ========================================================================
@@ -190,7 +243,11 @@ pub const Client = struct {
         var payload: [12]u8 = undefined;
         std.mem.writeInt(u64, payload[0..8], sid, .little);
         std.mem.writeInt(u32, payload[8..12], wid, .little);
-        return self.sendMessage(.window_to_space, &payload);
+        const result = self.sendMessage(.window_to_space, &payload);
+        if (!result) {
+            log.warn("moveWindowToSpace failed: sid={} wid={}", .{ sid, wid });
+        }
+        return result;
     }
 
     /// Order window relative to another

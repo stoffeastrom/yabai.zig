@@ -35,12 +35,17 @@ pub fn getDisplayId(sid: Id) ?u32 {
     const sl = skylight.get() catch return null;
     const cid = sl.SLSMainConnectionID();
 
-    const uuid = sl.SLSCopyManagedDisplayForSpace(cid, sid);
-    if (uuid == null) return null;
-    defer c.c.CFRelease(uuid);
+    const uuid_str = sl.SLSCopyManagedDisplayForSpace(cid, sid);
+    if (uuid_str == null) return null;
+    defer c.c.CFRelease(uuid_str);
+
+    // Convert UUID string to CFUUID
+    const uuid_ref = c.c.CFUUIDCreateFromString(null, uuid_str);
+    if (uuid_ref == null) return null;
+    defer c.c.CFRelease(uuid_ref);
 
     // Get display ID from UUID
-    return c.c.CGDisplayGetDisplayIDFromUUID(uuid);
+    return c.c.CGDisplayGetDisplayIDFromUUID(uuid_ref);
 }
 
 /// Get display UUID for space. Caller must CFRelease.

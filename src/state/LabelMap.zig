@@ -79,6 +79,14 @@ pub fn LabelMap(comptime Id: type) type {
             return false;
         }
 
+        /// Clear all labels
+        pub fn clear(self: *Self) void {
+            for (self.entries.items) |entry| {
+                self.allocator.free(entry.label);
+            }
+            self.entries.clearRetainingCapacity();
+        }
+
         /// Get count of labels
         pub fn count(self: *const Self) usize {
             return self.entries.items.len;

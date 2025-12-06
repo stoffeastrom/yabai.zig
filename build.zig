@@ -30,6 +30,37 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // SA Payload - arm64e dylib for Dock injection (must use clang)
+    const payload_cmd = b.addSystemCommand(&.{
+        "xcrun",                     "clang",
+        "src/sa/payload.m",          "-shared",
+        "-fPIC",                     "-O2",
+        "-mmacosx-version-min=14.0", "-arch",
+        "arm64e",                    "-framework",
+        "Foundation",                "-framework",
+        "CoreFoundation",            "-framework",
+        "CoreGraphics",              "-F/System/Library/PrivateFrameworks",
+        "-framework",                "SkyLight",
+        "-o",
+    });
+    const payload_output = payload_cmd.addOutputFileArg("libyabai.zig-sa.dylib");
+
+    const install_payload = b.addInstallLibFile(payload_output, "libyabai.zig-sa.dylib");
+    b.getInstallStep().dependOn(&install_payload.step);
+
+    // SA Loader - arm64e binary for injection (must use clang for PAC support)
+    const loader_cmd = b.addSystemCommand(&.{
+        "xcrun",                     "clang",
+        "src/sa/loader.m",           "-O2",
+        "-mmacosx-version-min=14.0", "-arch",
+        "x86_64",                    "-arch",
+        "arm64e",                    "-o",
+    });
+    const loader_output = loader_cmd.addOutputFileArg("yabai.zig-sa-loader");
+
+    const install_loader = b.addInstallBinFile(loader_output, "yabai.zig-sa-loader");
+    b.getInstallStep().dependOn(&install_loader.step);
+
     // Codesign step - signs with yabai.zig-cert if available
     const sign_cmd = b.addSystemCommand(&.{
         "/usr/bin/codesign",

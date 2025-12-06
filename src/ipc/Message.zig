@@ -169,7 +169,7 @@ pub const Command = union(enum) {
 
     // Space commands
     space_focus: SpaceSelector,
-    space_create: ?DisplaySelector,
+    space_create: struct { display: ?DisplaySelector = null, focus: bool = true, take: bool = false },
     space_destroy: SpaceSelector,
     space_move: struct { src: SpaceSelector, dst: SpaceSelector },
     space_swap: struct { src: SpaceSelector, dst: SpaceSelector },
@@ -363,10 +363,23 @@ fn parseSpaceCommand(tokenizer: *Tokenizer) ParseError!Command {
     }
 
     if (std.mem.eql(u8, cmd_str, "--create")) {
-        if (tokenizer.next()) |display_str| {
-            return .{ .space_create = DisplaySelector.parse(display_str) };
+        var display: ?DisplaySelector = null;
+        var focus: bool = true;
+        var take: bool = false;
+
+        // Parse optional flags
+        while (tokenizer.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--no-focus")) {
+                focus = false;
+            } else if (std.mem.eql(u8, arg, "--take")) {
+                take = true;
+            } else {
+                // Assume it's a display selector
+                display = DisplaySelector.parse(arg);
+            }
         }
-        return .{ .space_create = null };
+
+        return .{ .space_create = .{ .display = display, .focus = focus, .take = take } };
     }
 
     if (std.mem.eql(u8, cmd_str, "--destroy")) {
