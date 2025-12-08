@@ -128,7 +128,10 @@ pub fn main() !u8 {
         return 1;
     };
 
-    std.debug.print("\nyabai.zig stopped\n", .{});
+    // Print newline to clear ^C, then wait for daemon's final log to flush
+    std.debug.print("\n", .{});
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+    std.debug.print("yabai.zig stopped\n", .{});
 
     return switch (term) {
         .Exited => |code| code,
