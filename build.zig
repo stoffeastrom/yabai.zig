@@ -74,7 +74,7 @@ pub fn build(b: *std.Build) void {
     const install_loader = b.addInstallBinFile(loader_output, "yabai.zig-sa-loader");
     b.getInstallStep().dependOn(&install_loader.step);
 
-    // Sign step - signs main binary for stable TCC identity
+    // Sign step - signs main binary for stable TCC identity (requires yabai.zig-cert)
     const sign_cmd = b.addSystemCommand(&.{
         "/usr/bin/codesign",
         "-f",
@@ -86,12 +86,12 @@ pub fn build(b: *std.Build) void {
     sign_cmd.addArtifactArg(exe);
     sign_cmd.step.dependOn(b.getInstallStep());
 
-    // Make sign the default step (runs after install)
-    b.default_step = &sign_cmd.step;
+    const sign_step = b.step("sign", "Sign binary with yabai.zig-cert (for accessibility)");
+    sign_step.dependOn(&sign_cmd.step);
 
-    // Run step
+    // Run step (without signing - use for development/testing)
     const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(&sign_cmd.step);
+    run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
