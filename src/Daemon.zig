@@ -3078,11 +3078,13 @@ pub const Daemon = struct {
         self.spaces.setCurrentSpace(new_sid);
         self.last_space_change_time = @truncate(std.time.nanoTimestamp());
 
-        if (old_sid != new_sid) {
-            // Layout current space - don't refresh window spaces here,
-            // that causes chaos during space transitions. Window tracking
-            // is updated when windows are explicitly moved.
-            self.dirty.layout_current = true;
+        // Check if any windows moved between spaces (e.g., via Mission Control drag)
+        // This will mark moved windows and we'll layout affected spaces
+        const any_moved = self.refreshWindowSpaceIds();
+
+        if (old_sid != new_sid or any_moved) {
+            // Layout all spaces that might be affected
+            self.dirty.layout_all = true;
         }
     }
 
