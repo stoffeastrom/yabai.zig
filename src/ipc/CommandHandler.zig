@@ -77,11 +77,6 @@ pub fn execute(ctx: *Context, cmd: Message.Command) Result {
         // Display commands
         .display_focus => |sel| displayFocus(ctx, sel),
 
-        // Query commands - delegate to QueryHandler
-        .query_windows => |q| queryWindows(ctx, q.space, q.display),
-        .query_spaces => |q| querySpaces(ctx, q.display),
-        .query_displays => queryDisplays(ctx),
-
         // Config commands
         .config_get => |key| configGet(ctx, key),
         .config_set => |s| configSet(ctx, s.key, s.value),
@@ -90,7 +85,10 @@ pub fn execute(ctx: *Context, cmd: Message.Command) Result {
         .window_move => |m| windowMove(ctx, m.window, m.dx, m.dy, m.absolute),
         .window_resize => |r| windowResize(ctx, r.window, r.edge, r.dx, r.dy),
 
-        // Not yet implemented
+        // Not yet implemented (query commands handled earlier via QueryHandler)
+        .query_windows,
+        .query_spaces,
+        .query_displays,
         .window_deminimize,
         .window_stack,
         .window_ratio,
@@ -1193,29 +1191,6 @@ fn warpMouseToDisplay(ctx: *Context, did: Display.Id) void {
     _ = c.c.CGAssociateMouseAndMouseCursorPosition(0);
     _ = c.c.CGWarpMouseCursorPosition(center);
     _ = c.c.CGAssociateMouseAndMouseCursorPosition(1);
-}
-
-// ============================================================================
-// Query Commands
-// ============================================================================
-
-fn queryWindows(ctx: *Context, space_sel: ?Message.SpaceSelector, display_sel: ?Message.DisplaySelector) Result {
-    _ = space_sel;
-    _ = display_sel;
-    // TODO: build JSON response using ctx
-    _ = ctx;
-    return .{ .ok = "[]" };
-}
-
-fn querySpaces(ctx: *Context, display_sel: ?Message.DisplaySelector) Result {
-    _ = display_sel;
-    _ = ctx;
-    return .{ .ok = "[]" };
-}
-
-fn queryDisplays(ctx: *Context) Result {
-    _ = ctx;
-    return .{ .ok = "[]" };
 }
 
 // ============================================================================

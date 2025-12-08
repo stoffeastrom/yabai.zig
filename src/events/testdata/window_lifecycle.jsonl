@@ -1,0 +1,7 @@
+{"t":0,"e":"application_launched","pid":1234}
+{"t":100000000,"e":"window_created","wid":500,"pid":1234}
+{"t":200000000,"e":"window_focused","wid":500}
+{"t":500000000,"e":"window_minimized","wid":500}
+{"t":600000000,"e":"window_deminimized","wid":500}
+{"t":900000000,"e":"window_destroyed","wid":500}
+{"t":1000000000,"e":"application_terminated","pid":1234}

@@ -2,7 +2,6 @@ const std = @import("std");
 const c = @import("platform/c.zig");
 const skylight = @import("platform/skylight.zig");
 const Daemon = @import("Daemon.zig").Daemon;
-const trace = @import("trace/Tracer.zig");
 // Core types
 pub const geometry = @import("core/geometry.zig");
 pub const Window = @import("core/Window.zig");
@@ -23,6 +22,8 @@ pub const Event = @import("events/Event.zig");
 pub const EventLoop = @import("events/EventLoop.zig");
 pub const Mouse = @import("events/Mouse.zig");
 pub const Signal = @import("events/Signal.zig");
+pub const Store = @import("events/Store.zig");
+pub const Emulator = @import("events/Emulator.zig");
 
 // State
 pub const Windows = @import("state/Windows.zig");
@@ -95,6 +96,7 @@ const Args = struct {
     verbose: bool = false,
     config_file: [4096]u8 = undefined,
     timeout_ms: ?u64 = null,
+    record_path: ?[]const u8 = null,
 };
 
 var g: Args = .{};
@@ -127,6 +129,7 @@ fn printUsage() void {
         \\    --message, -m <msg>    Send message to a running instance of yabai.zig.
         \\    --config, -c <config>  Use the specified configuration file.
         \\    --timeout <ms>         Exit after specified milliseconds (for testing).
+        \\    --record <path>        Record events to file for replay testing.
         \\    --debug                Skip accessibility check (for development).
         \\    --verbose, -V          Output debug information to stdout.
         \\    --check-sa [path]      Analyze binary for SA patterns (default: Dock).
@@ -344,6 +347,13 @@ pub fn main() !u8 {
                 getStderr().writeAll("yabai.zig: invalid timeout value!\n") catch {};
                 return 1;
             };
+        } else if (std.mem.eql(u8, arg, "--record")) {
+            i += 1;
+            if (i >= args.len) {
+                getStderr().writeAll("yabai.zig: option '--record' requires a path!\n") catch {};
+                return 1;
+            }
+            g.record_path = args[i];
         } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
             i += 1;
             if (i >= args.len) {
@@ -1249,14 +1259,14 @@ fn startDaemon(skip_checks: bool) u8 {
     log_file = std.fs.createFileAbsolute("/tmp/yabai.zig.log", .{ .truncate = true }) catch null;
     defer if (log_file) |f| f.close();
 
-    // Initialize tracing (for Perfetto)
-    trace.init();
-
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var daemon = Daemon.initWithOptions(allocator, .{ .skip_checks = skip_checks }) catch |err| {
+    var daemon = Daemon.initWithOptions(allocator, .{
+        .skip_checks = skip_checks,
+        .record_path = g.record_path,
+    }) catch |err| {
         switch (err) {
             error.RunningAsRoot => log.err("yabai.zig cannot run as root", .{}),
             error.NoAccessibility => log.err("accessibility permissions required", .{}),
@@ -1307,7 +1317,11 @@ fn startDaemon(skip_checks: bool) u8 {
     // Start tracking running applications for auto-tiling (after config loaded)
     daemon.startApplicationTracking();
 
-    log.info("yabai.zig {s} started", .{Version.string()});
+    if (g.record_path != null) {
+        log.info("yabai.zig {s} started (recording to {s})", .{ Version.string(), g.record_path.? });
+    } else {
+        log.info("yabai.zig {s} started", .{Version.string()});
+    }
 
     // Run the main event loop (blocks until stopped or timeout)
     if (g.timeout_ms) |timeout| {
@@ -1346,6 +1360,8 @@ test {
     _ = EventLoop;
     _ = Mouse;
     _ = Signal;
+    _ = Store;
+    _ = Emulator;
 
     // State
     _ = Windows;
@@ -1367,6 +1383,6 @@ test {
     // SA
     _ = sa_extractor;
 
-    // Tracing
-    _ = trace;
+    // Daemon (includes daemon/layout tests)
+    _ = Daemon;
 }

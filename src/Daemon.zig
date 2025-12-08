@@ -17,153 +17,28 @@ const Apps = @import("state/Apps.zig");
 const Config = @import("config/Config.zig");
 const WorkspaceObserver = @import("platform/WorkspaceObserver.zig").WorkspaceObserver;
 const Event = @import("events/Event.zig").Event;
+const Store = @import("events/Store.zig").Store;
 const sa_extractor = @import("sa/extractor.zig");
 const sa_patterns = @import("sa/patterns.zig");
 const SAClient = @import("sa/client.zig").Client;
-const trace = @import("trace/Tracer.zig");
+const Platform = @import("platform/Platform.zig").Platform;
+const Real = @import("platform/Real.zig").Real;
+
+// Sub-modules
+const types = @import("daemon/types.zig");
+const daemon_init = @import("daemon/init.zig");
+const observers = @import("daemon/observers.zig");
+const daemon_events = @import("daemon/events.zig");
+const daemon_layout = @import("daemon/layout.zig");
 
 const log = std.log.scoped(.daemon);
 
-pub const MAXLEN = 512;
-
-/// SA (Scripting Addition) capabilities discovered at runtime
-pub const SACapabilities = struct {
-    /// Whether SA functions were discovered successfully
-    available: bool = false,
-    /// Number of functions discovered (out of 7)
-    discovered_count: usize = 0,
-    /// Individual function availability
-    can_add_space: bool = false,
-    can_remove_space: bool = false,
-    can_move_space: bool = false,
-    can_focus_window: bool = false,
-    /// Discovered function addresses (for future use)
-    discovery: ?sa_extractor.DiscoveryResult = null,
-};
-
-/// Dirty state flags - accumulated during event handling, processed once per loop tick
-pub const DirtyFlags = packed struct(u32) {
-    // Layout flags
-    /// Need to apply layout to current space
-    layout_current: bool = false,
-    /// Need to apply layout to all visible spaces
-    layout_all: bool = false,
-    /// Need to rebuild BSP tree (not just reapply)
-    rebuild_view: bool = false,
-
-    // Sync flags
-    /// Need to rescan running applications
-    scan_apps: bool = false,
-    /// Need to sync space labels with config
-    sync_spaces: bool = false,
-    /// Need to sync config to state
-    sync_config: bool = false,
-
-    // Validation flags
-    /// Need to validate all state (remove stale, refresh from macOS)
-    validate_state: bool = false,
-    /// Need to refresh window-to-space mappings from macOS
-    refresh_window_spaces: bool = false,
-
-    // Pending app events (queued PIDs processed in batch)
-    /// One or more apps launched - need to track them
-    apps_launched: bool = false,
-    /// One or more apps terminated - need to clean up
-    apps_terminated: bool = false,
-    /// App front switched - need to update focus tracking
-    app_focus_changed: bool = false,
-    /// One or more apps hidden
-    apps_hidden: bool = false,
-    /// One or more apps shown
-    apps_shown: bool = false,
-
-    /// Reserved for future use
-    _padding: u19 = 0,
-
-    /// Check if any work is pending
-    pub fn any(self: DirtyFlags) bool {
-        return @as(u32, @bitCast(self)) != 0;
-    }
-
-    /// Clear all flags
-    pub fn clear(self: *DirtyFlags) void {
-        self.* = .{};
-    }
-};
-
-/// Dirty space tracking - which spaces need layout
-pub const DirtySpaces = struct {
-    /// Spaces that need layout (by space ID)
-    spaces: [16]u64 = [_]u64{0} ** 16,
-    count: u8 = 0,
-
-    /// Mark a space as needing layout
-    pub fn mark(self: *DirtySpaces, space_id: u64) void {
-        // Check if already marked
-        for (self.spaces[0..self.count]) |sid| {
-            if (sid == space_id) return;
-        }
-        // Add if room
-        if (self.count < self.spaces.len) {
-            self.spaces[self.count] = space_id;
-            self.count += 1;
-        }
-    }
-
-    /// Check if a space is marked dirty
-    pub fn isDirty(self: *const DirtySpaces, space_id: u64) bool {
-        for (self.spaces[0..self.count]) |sid| {
-            if (sid == space_id) return true;
-        }
-        return false;
-    }
-
-    /// Clear all marked spaces
-    pub fn clear(self: *DirtySpaces) void {
-        self.count = 0;
-    }
-
-    /// Check if any spaces are dirty
-    pub fn any(self: *const DirtySpaces) bool {
-        return self.count > 0;
-    }
-};
-
-/// Queue for pending PID events - fixed size ring buffer
-pub const PidQueue = struct {
-    pids: [32]c.pid_t = [_]c.pid_t{0} ** 32,
-    count: u8 = 0,
-
-    /// Add a PID to the queue (deduplicates)
-    pub fn push(self: *PidQueue, pid: c.pid_t) void {
-        // Check if already queued
-        for (self.pids[0..self.count]) |p| {
-            if (p == pid) return;
-        }
-        // Add if room
-        if (self.count < self.pids.len) {
-            self.pids[self.count] = pid;
-            self.count += 1;
-        }
-    }
-
-    /// Get all queued PIDs and clear
-    pub fn drain(self: *PidQueue) []const c.pid_t {
-        const result = self.pids[0..self.count];
-        self.count = 0;
-        return result;
-    }
-
-    /// Check if any PIDs are queued
-    pub fn any(self: *const PidQueue) bool {
-        return self.count > 0;
-    }
-
-    /// Clear the queue
-    pub fn clear(self: *PidQueue) void {
-        self.count = 0;
-    }
-};
+// Re-export types from daemon/types.zig
+pub const MAXLEN = types.MAXLEN;
+pub const SACapabilities = types.SACapabilities;
+pub const DirtyFlags = types.DirtyFlags;
+pub const DirtySpaces = types.DirtySpaces;
+pub const PidQueue = types.PidQueue;
 
 pub const Daemon = struct {
     allocator: std.mem.Allocator,
@@ -172,6 +47,10 @@ pub const Daemon = struct {
     pid: c.pid_t = 0,
     connection: c_int = 0,
     skylight: *const skylight.SkyLight,
+
+    // Platform abstraction (for testing)
+    platform: Platform = undefined,
+    real_platform: ?Real = null,
 
     // Paths
     socket_path: [MAXLEN]u8 = undefined,
@@ -213,8 +92,7 @@ pub const Daemon = struct {
     sa_client: ?SAClient = null,
 
     // Event tap for focus follows mouse
-    mouse_event_tap: c.c.CFMachPortRef = null,
-    mouse_event_source: c.c.CFRunLoopSourceRef = null,
+    mouse_tap: observers.MouseEventTap = .{},
     ffm_window_id: u32 = 0, // One-shot: window ID that FFM is currently focusing (cleared on focus confirm)
     last_ffm_time: i64 = 0, // Timestamp of last FFM focus attempt (nanoseconds)
     last_validation_time: i64 = 0, // Timestamp of last state validation
@@ -238,6 +116,10 @@ pub const Daemon = struct {
     // Deferred window moves - when SA was unavailable during display change
     pending_window_moves: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pending_moves_time: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+
+    // Event recording (optional, for --record flag)
+    event_store: ?Store = null,
+    record_path: ?[]const u8 = null,
 
     // Global instance pointer for static callbacks
     var instance: ?*Self = null;
@@ -265,6 +147,7 @@ pub const Daemon = struct {
 
     pub const InitOptions = struct {
         skip_checks: bool = false,
+        record_path: ?[]const u8 = null,
     };
 
     pub fn init(allocator: std.mem.Allocator) InitError!Self {
@@ -280,6 +163,8 @@ pub const Daemon = struct {
             .windows = Windows.init(allocator),
             .apps = Apps.init(allocator),
             .config = Config.initWithAllocator(allocator),
+            .record_path = options.record_path,
+            .event_store = if (options.record_path != null) Store.init(allocator) else null,
         };
 
         // Check preconditions (can be skipped for testing)
@@ -299,6 +184,20 @@ pub const Daemon = struct {
         // Note: Server is started later via startServer() after the struct is at its final address
 
         return self;
+    }
+
+    /// Initialize for testing with a mock platform (no macOS dependencies)
+    pub fn initForTest(allocator: std.mem.Allocator, platform: Platform) Self {
+        return Self{
+            .allocator = allocator,
+            .skylight = undefined,
+            .displays = Displays.init(allocator),
+            .spaces = Spaces.init(allocator),
+            .windows = Windows.init(allocator),
+            .apps = Apps.init(allocator),
+            .config = Config.initWithAllocator(allocator),
+            .platform = platform,
+        };
     }
 
     /// Start the IPC server. Must be called after init, once the Daemon struct is at its final address.
@@ -328,68 +227,28 @@ pub const Daemon = struct {
     /// Start mouse event tap for focus follows mouse
     pub fn startMouseEventTap(self: *Self) void {
         if (self.config.focus_follows_mouse == .disabled) return;
-        if (self.mouse_event_tap != null) return;
+        if (self.mouse_tap.tap != null) return;
 
-        // Create event tap for mouse moved events
-        const event_mask: u64 = (1 << c.c.kCGEventMouseMoved);
-
-        self.mouse_event_tap = c.c.CGEventTapCreate(
-            c.c.kCGSessionEventTap,
-            c.c.kCGHeadInsertEventTap,
-            c.c.kCGEventTapOptionDefault,
-            event_mask,
-            mouseEventCallback,
-            null,
-        );
-
-        if (self.mouse_event_tap == null) {
-            log.err("failed to create mouse event tap - check accessibility permissions", .{});
-            return;
+        if (self.mouse_tap.start(mouseEventCallback)) {
+            log.info("focus follows mouse enabled (mode={})", .{self.config.focus_follows_mouse});
         }
-
-        self.mouse_event_source = c.c.CFMachPortCreateRunLoopSource(null, self.mouse_event_tap, 0);
-        if (self.mouse_event_source == null) {
-            log.err("failed to create mouse event tap run loop source", .{});
-            c.c.CFRelease(self.mouse_event_tap);
-            self.mouse_event_tap = null;
-            return;
-        }
-
-        c.c.CFRunLoopAddSource(c.c.CFRunLoopGetMain(), self.mouse_event_source, c.c.kCFRunLoopDefaultMode);
-        c.c.CGEventTapEnable(self.mouse_event_tap, true);
-
-        log.info("focus follows mouse enabled (mode={})", .{self.config.focus_follows_mouse});
     }
 
     /// Stop mouse event tap
     pub fn stopMouseEventTap(self: *Self) void {
-        if (self.mouse_event_source) |source| {
-            c.c.CFRunLoopRemoveSource(c.c.CFRunLoopGetMain(), source, c.c.kCFRunLoopDefaultMode);
-            c.c.CFRelease(source);
-            self.mouse_event_source = null;
-        }
-        if (self.mouse_event_tap) |tap| {
-            c.c.CGEventTapEnable(tap, false);
-            c.c.CFRelease(tap);
-            self.mouse_event_tap = null;
-        }
+        self.mouse_tap.stop();
     }
 
     /// Start display reconfiguration observer
     pub fn startDisplayObserver(self: *Self) void {
         _ = self;
-        const result = c.c.CGDisplayRegisterReconfigurationCallback(displayReconfigurationCallback, null);
-        if (result != 0) {
-            log.err("failed to register display reconfiguration callback: {}", .{result});
-            return;
-        }
-        log.info("display observer started", .{});
+        observers.startDisplayObserver(displayReconfigurationCallback);
     }
 
     /// Stop display reconfiguration observer
     pub fn stopDisplayObserver(self: *Self) void {
         _ = self;
-        _ = c.c.CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, null);
+        observers.stopDisplayObserver(displayReconfigurationCallback);
     }
 
     /// Display reconfiguration callback - just marks pending, actual work is debounced
@@ -480,12 +339,12 @@ pub const Daemon = struct {
             log.info("  display {}: {s} ({s})", .{ did, label, builtin_str });
 
             // Log spaces on this display
-            const display_spaces = Display.getSpaceList(self.allocator, did) catch continue;
+            const display_spaces = self.platform.getDisplaySpaces(self.allocator, did) orelse continue;
             defer self.allocator.free(display_spaces);
 
             for (display_spaces) |sid| {
                 const space_label = self.spaces.getLabelForSpace(sid) orelse "(unlabeled)";
-                const space_type = Space.getType(sid);
+                const space_type = self.platform.getSpaceType(sid);
                 const type_str = switch (space_type) {
                     .user => "user",
                     .system => "system",
@@ -555,11 +414,10 @@ pub const Daemon = struct {
             event_type == c.c.kCGEventTapDisabledByUserInput)
         {
             // Re-enable the tap if it gets disabled
-            if (self.mouse_event_tap) |tap| {
+            if (!self.mouse_tap.isEnabled()) {
                 log.warn("ffm: event tap was disabled, re-enabling", .{});
-                c.c.CGEventTapEnable(tap, true);
-                // Verify it's actually enabled
-                if (!c.c.CGEventTapIsEnabled(tap)) {
+                self.mouse_tap.reenable();
+                if (!self.mouse_tap.isEnabled()) {
                     log.err("ffm: failed to re-enable event tap - FFM will stop working", .{});
                 }
             }
@@ -587,7 +445,7 @@ pub const Daemon = struct {
         // Periodically validate focused_window_id still exists (every 500ms)
         if (elapsed_ms > 500) {
             if (self.windows.getFocusedId()) |focused_wid| {
-                if (Window.getSpace(focused_wid) == 0) {
+                if (self.platform.getWindowSpace(focused_wid) == null) {
                     log.debug("ffm: focused_window_id={d} no longer exists, clearing", .{focused_wid});
                     self.windows.setFocused(null);
                 }
@@ -636,8 +494,8 @@ pub const Daemon = struct {
         const win_info = self.windows.getWindow(window_id) orelse return event;
 
         // Validate the window still exists (guards against stale tracking)
-        const actual_space = Window.getSpace(window_id);
-        if (actual_space == 0) {
+        const actual_space = self.platform.getWindowSpace(window_id);
+        if (actual_space == null) {
             // Window no longer exists - clean up stale tracking
             log.debug("ffm: wid={d} no longer exists, cleaning up", .{window_id});
             _ = self.windows.removeWindow(window_id);
@@ -675,72 +533,68 @@ pub const Daemon = struct {
     /// Focus window without raising it (for autofocus mode)
     /// Returns true if focus succeeded
     fn focusWindowWithoutRaise(_: *Self, wid: Window.Id, pid: c.pid_t, ax_ref: ?c.AXUIElementRef) bool {
-        // Use AX to make this the main window (focuses within the app)
-        if (ax_ref) |ref| {
-            const kAXMainAttribute = c.cfstr("AXMain");
-            defer c.c.CFRelease(kAXMainAttribute);
-            const result = c.c.AXUIElementSetAttributeValue(ref, kAXMainAttribute, c.c.kCFBooleanTrue);
-            if (result != 0) {
-                // AX error - element may be stale
-                log.debug("ffm: AXMain failed for wid={d} (err={}), ax_ref may be stale", .{ wid, result });
-            }
-        }
-
-        // Bring app to front without raising windows
-        var psn: c.c.ProcessSerialNumber = undefined;
-        if (c.c.GetProcessForPID(pid, &psn) != 0) {
-            log.debug("ffm: GetProcessForPID failed for pid={d}", .{pid});
-            return false;
-        }
-
-        const result = c.c.SetFrontProcessWithOptions(&psn, c.c.kSetFrontProcessFrontWindowOnly);
-        if (result != 0) {
-            log.debug("ffm: SetFrontProcessWithOptions failed for pid={d} (err={})", .{ pid, result });
-            return false;
-        }
-
-        log.debug("ffm: autofocus wid={d}", .{wid});
-        return true;
+        return daemon_events.focusWindowWithoutRaise(wid, pid, ax_ref);
     }
 
     /// Focus window and raise it (for autoraise mode)
     /// Returns true if focus succeeded
     fn focusWindowWithRaise(self: *Self, wid: Window.Id, pid: c.pid_t) bool {
-        var ax_success = false;
+        const ax_ref = if (self.windows.getWindow(wid)) |win_info| win_info.ax_ref else null;
+        return daemon_events.focusWindowWithRaise(wid, pid, ax_ref);
+    }
 
-        // Get AX element and raise
-        if (self.windows.getWindow(wid)) |win_info| {
-            if (win_info.ax_ref) |ax_ref| {
-                const kAXRaiseAction = c.cfstr("AXRaise");
-                defer c.c.CFRelease(kAXRaiseAction);
-                const kAXMainAttribute = c.cfstr("AXMain");
-                defer c.c.CFRelease(kAXMainAttribute);
-
-                const raise_result = c.c.AXUIElementPerformAction(ax_ref, kAXRaiseAction);
-                const main_result = c.c.AXUIElementSetAttributeValue(ax_ref, kAXMainAttribute, c.c.kCFBooleanTrue);
-
-                ax_success = (raise_result == 0 and main_result == 0);
-                if (!ax_success) {
-                    log.debug("ffm: AX raise/main failed for wid={d} (raise={}, main={})", .{ wid, raise_result, main_result });
+    /// Public event handler for testing - processes an event directly on this instance
+    pub fn processEvent(self: *Self, event: Event) void {
+        switch (event) {
+            .application_launched => |e| {
+                if (e.pid > 0 and e.pid != self.pid) {
+                    self.handleApplicationLaunched(e.pid);
                 }
-            }
+            },
+            .application_terminated => |e| {
+                if (e.pid > 0) {
+                    self.handleApplicationTerminated(e.pid);
+                }
+            },
+            .application_front_switched => |e| {
+                self.handleApplicationFrontSwitched(e.pid);
+            },
+            .application_hidden => |e| {
+                self.handleApplicationHidden(e.pid);
+            },
+            .application_visible => |e| {
+                self.handleApplicationVisible(e.pid);
+            },
+            .space_changed => |_| {
+                self.handleSpaceChanged();
+            },
+            .system_woke => {
+                self.handleSystemWoke();
+            },
+            // Window events - update state directly since handlers may use macOS APIs
+            .window_created => |e| {
+                const entry = Windows.TrackedWindow{
+                    .id = e.window_id,
+                    .pid = e.pid orelse 0,
+                    .space_id = self.platform.getWindowSpace(e.window_id) orelse 0,
+                    .ax_ref = null, // Mock doesn't have real ax_refs
+                };
+                self.windows.addWindow(entry) catch {};
+            },
+            .window_destroyed => |e| {
+                _ = self.windows.removeWindow(e.window_id);
+            },
+            .window_focused => |e| {
+                self.windows.setFocused(e.window_id);
+            },
+            .window_minimized => |e| {
+                self.windows.setMinimized(e.window_id, true);
+            },
+            .window_deminimized => |e| {
+                self.windows.setMinimized(e.window_id, false);
+            },
+            else => {},
         }
-
-        // Also bring app to front
-        var psn: c.c.ProcessSerialNumber = undefined;
-        if (c.c.GetProcessForPID(pid, &psn) != 0) {
-            log.debug("ffm: GetProcessForPID failed for pid={d}", .{pid});
-            return false;
-        }
-
-        const result = c.c.SetFrontProcessWithOptions(&psn, c.c.kSetFrontProcessFrontWindowOnly);
-        if (result != 0) {
-            log.debug("ffm: SetFrontProcessWithOptions failed for pid={d} (err={})", .{ pid, result });
-            return false;
-        }
-
-        log.debug("ffm: autoraise wid={d}", .{wid});
-        return true;
     }
 
     /// Handle workspace events from NSWorkspace notifications
@@ -750,16 +604,19 @@ pub const Daemon = struct {
         // Check if shutting down
         if (self.shutting_down.load(.acquire)) return;
 
+        // Record event if recording is enabled
+        if (self.event_store) |*store| {
+            store.recordEvent(event) catch {};
+        }
+
         switch (event) {
             .application_launched => |e| {
                 if (e.pid > 0 and e.pid != self.pid) {
-                    trace.instant("app_launched", .event, .{ .pid = e.pid });
                     self.handleApplicationLaunched(e.pid);
                 }
             },
             .application_terminated => |e| {
                 if (e.pid > 0) {
-                    trace.instant("app_terminated", .event, .{ .pid = e.pid });
                     self.handleApplicationTerminated(e.pid);
                 }
             },
@@ -776,7 +633,6 @@ pub const Daemon = struct {
                 self.handleApplicationVisible(e.pid);
             },
             .space_changed => |_| {
-                trace.instant("space_changed", .space, .{});
                 log.debug("space changed", .{});
                 self.handleSpaceChanged();
             },
@@ -786,7 +642,6 @@ pub const Daemon = struct {
                 log.debug("active display changed (no relayout needed)", .{});
             },
             .system_woke => {
-                trace.instant("system_woke", .event, .{});
                 log.info("system woke - rebuilding layouts", .{});
                 self.handleSystemWoke();
             },
@@ -813,6 +668,18 @@ pub const Daemon = struct {
         // Small delay to let in-flight callbacks complete
         std.Thread.sleep(50 * std.time.ns_per_ms);
 
+        // Save recording if enabled
+        if (self.event_store) |*store| {
+            if (self.record_path) |path| {
+                const records = store.getRecords();
+                log.info("saving {} recorded events to {s}", .{ records.len, path });
+                store.saveJsonl(path) catch |err| {
+                    log.err("failed to save recording: {}", .{err});
+                };
+            }
+            store.deinit();
+        }
+
         self.stopMouseEventTap();
         self.stopDisplayObserver();
         if (self.workspace_observer) |*obs| {
@@ -834,105 +701,34 @@ pub const Daemon = struct {
 
     fn checkPreconditions(self: *Self) InitError!void {
         _ = self;
-
-        // Check not running as root
-        if (c.c.getuid() == 0) {
-            log.err("running as root is not allowed", .{});
-            return error.RunningAsRoot;
-        }
-
-        // Check accessibility permissions
-        if (!ax.isProcessTrustedWithOptions(true)) {
-            log.err("could not access accessibility features", .{});
-            return error.NoAccessibility;
-        }
+        return daemon_init.checkPreconditions();
     }
 
     fn initPaths(self: *Self) InitError!void {
-        const user = std.posix.getenv("USER") orelse {
-            log.err("'env USER' not set", .{});
-            return error.NoUser;
-        };
-
-        // Format socket paths - buffers are 512 bytes, paths are ~40 chars max
-        // Username max is ~256 chars on macOS, so this cannot overflow
-        _ = std.fmt.bufPrintZ(&self.socket_path, "/tmp/yabai.zig_{s}.socket", .{user}) catch unreachable;
-        _ = std.fmt.bufPrintZ(&self.sa_socket_path, "/tmp/yabai.zig-sa_{s}.socket", .{user}) catch unreachable;
-        _ = std.fmt.bufPrintZ(&self.lock_path, "/tmp/yabai.zig_{s}.lock", .{user}) catch unreachable;
-
-        // Initialize SA client with socket path
-        const sa_path = std.mem.sliceTo(&self.sa_socket_path, 0);
-        log.debug("SA socket path: {s} (len={}, ptr={*})", .{ sa_path, sa_path.len, sa_path.ptr });
-        self.sa_client = SAClient.init(sa_path);
+        const sa_path = try daemon_init.initPaths(&self.socket_path, &self.sa_socket_path, &self.lock_path);
+        self.sa_client = daemon_init.initSAClient(sa_path);
     }
 
     fn acquireLock(self: *Self) InitError!void {
-        const path = std.mem.sliceTo(&self.lock_path, 0);
-
-        const fd = std.posix.open(path, .{
-            .ACCMODE = .WRONLY,
-            .CREAT = true,
-        }, 0o600) catch {
-            log.err("could not create lock file: {s}", .{path});
-            return error.LockFileCreate;
-        };
-
-        // Try to acquire exclusive lock (non-blocking)
-        std.posix.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB) catch {
-            std.posix.close(fd);
-            log.err("could not acquire lock - another instance running?", .{});
-            return error.LockFileAcquire;
-        };
-
-        self.lock_fd = fd;
+        self.lock_fd = try daemon_init.acquireLock(&self.lock_path);
     }
 
     fn initMacOS(self: *Self) InitError!void {
-        // Load NSApplication (required for event loop)
-        _ = c.NSApplicationLoad();
+        const result = try daemon_init.initMacOS(handleSignal);
+        self.skylight = result.skylight;
+        self.connection = result.connection;
+        self.pid = result.pid;
+        self.layer_normal = result.layer_normal;
+        self.layer_below = result.layer_below;
+        self.layer_above = result.layer_above;
 
-        // Get our PID
-        self.pid = c.getpid();
-
-        // Initialize SkyLight
-        self.skylight = skylight.get() catch {
-            log.err("failed to load SkyLight framework", .{});
-            return error.SkylightInit;
+        // Initialize platform abstraction
+        const sa_ptr: ?*SAClient = if (self.sa_client != null) &self.sa_client.? else null;
+        self.real_platform = Real.init(self.allocator, sa_ptr) catch {
+            log.warn("failed to init Real platform, some features unavailable", .{});
+            return;
         };
-
-        // Get main connection ID
-        self.connection = self.skylight.SLSMainConnectionID();
-
-        // Check "displays have separate spaces" is enabled
-        if (self.skylight.SLSGetSpaceManagementMode(self.connection) != 1) {
-            log.err("'display has separate spaces' is disabled", .{});
-            return error.SeparateSpacesDisabled;
-        }
-
-        // Get window level constants
-        self.layer_normal = c.c.CGWindowLevelForKey(c.c.kCGNormalWindowLevelKey);
-        self.layer_below = c.c.CGWindowLevelForKey(c.c.kCGDesktopIconWindowLevelKey);
-        self.layer_above = c.c.CGWindowLevelForKey(c.c.kCGFloatingWindowLevelKey);
-
-        // Ignore SIGCHLD and SIGPIPE
-        var sig_action: std.posix.Sigaction = .{
-            .handler = .{ .handler = std.posix.SIG.IGN },
-            .mask = std.posix.sigemptyset(),
-            .flags = 0,
-        };
-        std.posix.sigaction(std.posix.SIG.CHLD, &sig_action, null);
-        std.posix.sigaction(std.posix.SIG.PIPE, &sig_action, null);
-
-        // Handle SIGINT/SIGTERM for clean shutdown
-        const stop_action: std.posix.Sigaction = .{
-            .handler = .{ .handler = handleSignal },
-            .mask = std.posix.sigemptyset(),
-            .flags = 0,
-        };
-        std.posix.sigaction(std.posix.SIG.INT, &stop_action, null);
-        std.posix.sigaction(std.posix.SIG.TERM, &stop_action, null);
-
-        log.info("yabai.zig started (pid={d}, connection={d})", .{ self.pid, self.connection });
+        self.platform = self.real_platform.?.platform();
     }
 
     /// Discover SA (Scripting Addition) capabilities by analyzing Dock.app
@@ -1026,9 +822,6 @@ pub const Daemon = struct {
 
     /// Handle incoming IPC message using typed command parsing
     fn handleMessage(client_fd: std.posix.socket_t, message: []const u8, context: ?*anyopaque) void {
-        const span = trace.begin("ipc_message", .ipc);
-        defer span.end();
-
         const context_ptr = context orelse {
             log.err("handleMessage: null context", .{});
             Server.sendErr(client_fd, Response.err(.unknown_domain));
@@ -1230,37 +1023,15 @@ pub const Daemon = struct {
     }
 
     fn spaceIdFromIndex(self: *Self, index: u64) ?u64 {
-        if (index == 0) return null;
-        const spaces = self.getAllSpaceIds() orelse return null;
-        defer self.allocator.free(spaces);
-        if (index > spaces.len) return null;
-        return spaces[index - 1];
+        return daemon_layout.spaceIdFromIndex(self.allocator, self.platform, index);
     }
 
     fn getCurrentSpaceId(self: *Self) ?u64 {
-        _ = self;
-        const main_display = Displays.getMainDisplayId();
-        return Display.getCurrentSpace(main_display);
+        return daemon_layout.getCurrentSpaceId(self.platform);
     }
 
     fn getAllSpaceIds(self: *Self) ?[]u64 {
-        const displays = Displays.getActiveDisplayList(self.allocator) catch return null;
-        defer self.allocator.free(displays);
-
-        var all_spaces: std.ArrayList(u64) = .empty;
-        for (displays) |did| {
-            const spaces = Display.getSpaceList(self.allocator, did) catch continue;
-            defer self.allocator.free(spaces);
-            for (spaces) |sid| {
-                all_spaces.append(self.allocator, sid) catch continue;
-            }
-        }
-
-        if (all_spaces.items.len == 0) {
-            all_spaces.deinit(self.allocator);
-            return null;
-        }
-        return all_spaces.toOwnedSlice(self.allocator) catch null;
+        return daemon_layout.getAllSpaceIds(self.allocator, self.platform);
     }
 
     /// Reload config: re-apply spaces, profiles, and rules to current state
@@ -1354,67 +1125,19 @@ pub const Daemon = struct {
 
     /// Apply layout to a specific space
     fn applyLayoutToSpace(self: *Self, space_id: u64) void {
-        const span = trace.beginArgs("apply_layout", .layout, .{ .space = space_id });
-        defer span.end();
-
         if (self.getBoundsForSpace(space_id)) |bounds| {
-            self.spaces.applyLayout(space_id, bounds, &self.windows) catch |err| {
-                log.err("failed to apply layout to space {d}: {}", .{ space_id, err });
-            };
+            daemon_layout.applyLayoutToSpace(&self.spaces, &self.windows, space_id, bounds);
         }
     }
 
     /// Warp mouse cursor to center of window (if not already inside)
     fn warpMouseToWindow(self: *Self, wid: Window.Id) void {
-        const frame = Window.getFrame(wid) catch {
-            log.debug("mouse warp: failed to get frame for wid={d}", .{wid});
-            return;
-        };
-
-        // Check if cursor is already inside window
-        var cursor: c.CGPoint = undefined;
-        if (self.skylight.SLSGetCurrentCursorLocation(self.connection, &cursor) == 0) {
-            if (cursor.x >= frame.x and cursor.x <= frame.x + frame.width and
-                cursor.y >= frame.y and cursor.y <= frame.y + frame.height)
-            {
-                log.debug("mouse warp: cursor already inside wid={d}", .{wid});
-                return;
-            }
-        }
-
-        // Warp to center
-        const center = c.CGPoint{
-            .x = frame.x + frame.width / 2,
-            .y = frame.y + frame.height / 2,
-        };
-
-        _ = c.c.CGAssociateMouseAndMouseCursorPosition(0);
-        _ = c.c.CGWarpMouseCursorPosition(center);
-        _ = c.c.CGAssociateMouseAndMouseCursorPosition(1);
-        log.debug("mouse warp: wid={d} to ({d:.0},{d:.0})", .{ wid, center.x, center.y });
+        daemon_layout.warpMouseToWindow(self.platform, wid);
     }
 
     /// Get bounds for a space (display bounds minus padding and external bar)
     fn getBoundsForSpace(self: *Self, space_id: u64) ?geometry.Rect {
-        const display_id = self.getDisplayForSpace(space_id) orelse return null;
-        var bounds = Display.getBounds(display_id);
-
-        // Apply external bar (e.g., SketchyBar)
-        const bar = self.config.external_bar;
-        const apply_bar = switch (bar.position) {
-            .off => false,
-            .main => display_id == Displays.getMainDisplayId(),
-            .all => true,
-        };
-        if (apply_bar) {
-            bounds.y += @floatFromInt(bar.top_padding);
-            bounds.height -= @floatFromInt(bar.top_padding + bar.bottom_padding);
-        }
-
-        // Note: View.setArea() applies its own padding from Spaces config
-        // So we don't apply config padding here - just external_bar offset
-
-        return bounds;
+        return daemon_layout.getBoundsForSpace(self.platform, &self.displays, &self.config, space_id);
     }
 
     /// Flush all dirty views - applies layout to current space
@@ -1435,16 +1158,7 @@ pub const Daemon = struct {
     }
 
     fn getDisplayForSpace(self: *Self, space_id: u64) ?u32 {
-        const sl = self.skylight;
-        const cid = self.connection;
-
-        const space_uuid = sl.SLSCopyManagedDisplayForSpace(cid, space_id);
-        if (space_uuid == null) return null;
-        defer c.c.CFRelease(space_uuid);
-
-        // Convert CFString UUID to display ID
-        const display_id = Display.getId(space_uuid);
-        return if (display_id != 0) display_id else null;
+        return self.platform.getSpaceDisplay(space_id);
     }
 
     /// Run the main event loop. Blocks until stop() is called.
@@ -1567,9 +1281,6 @@ pub const Daemon = struct {
         // Skip if nothing to do
         if (!self.dirty.any() and !self.dirty_spaces.any()) return;
 
-        const span = trace.begin("process_dirty", .event);
-        defer span.end();
-
         // Track if we need layout at the end
         var needs_layout_current = self.dirty.layout_current;
         const needs_layout_all = self.dirty.layout_all;
@@ -1579,8 +1290,6 @@ pub const Daemon = struct {
         // =====================================================================
 
         if (self.dirty.validate_state) {
-            const s = trace.begin("validate_state", .event);
-            defer s.end();
             self.validateState();
         }
 
@@ -1605,26 +1314,18 @@ pub const Daemon = struct {
         // =====================================================================
 
         if (self.dirty.refresh_window_spaces) {
-            const s = trace.begin("refresh_window_spaces", .event);
-            defer s.end();
             _ = self.refreshWindowSpaceIds();
         }
 
         if (self.dirty.scan_apps) {
-            const s = trace.begin("scan_apps", .event);
-            defer s.end();
             self.scanRunningApplications();
         }
 
         if (self.dirty.sync_spaces) {
-            const s = trace.begin("sync_spaces", .space);
-            defer s.end();
             self.syncSpaces();
         }
 
         if (self.dirty.sync_config) {
-            const s = trace.begin("sync_config", .config);
-            defer s.end();
             self.syncConfigToState();
         }
 
@@ -1694,8 +1395,6 @@ pub const Daemon = struct {
         // =====================================================================
 
         if (self.dirty.rebuild_view) {
-            const s = trace.begin("rebuild_view", .layout);
-            defer s.end();
             if (self.getCurrentSpaceId()) |sid| {
                 self.spaces.removeView(sid);
             }
@@ -1706,17 +1405,16 @@ pub const Daemon = struct {
         // =====================================================================
 
         if (needs_layout_all) {
-            const s = trace.begin("layout_all", .layout);
-            defer s.end();
             self.applyAllSpaceLayouts();
         } else if (needs_layout_current) {
-            const s = trace.begin("layout_current", .layout);
-            defer s.end();
             self.applyCurrentLayout();
         } else if (self.dirty_spaces.any()) {
             for (self.dirty_spaces.spaces[0..self.dirty_spaces.count]) |sid| {
-                if (Space.isVisible(sid)) {
-                    self.applyLayoutToSpace(sid);
+                // Check if space is visible (current space on its display)
+                if (self.platform.getSpaceDisplay(sid)) |did| {
+                    if (self.platform.getActiveSpaceForDisplay(did) == sid) {
+                        self.applyLayoutToSpace(sid);
+                    }
                 }
             }
         }
@@ -1748,7 +1446,7 @@ pub const Daemon = struct {
         var win_it = self.windows.iterator();
         while (win_it.next()) |entry| {
             const wid = entry.key_ptr.*;
-            if (Window.getSpace(wid) == 0) {
+            if (self.platform.getWindowSpace(wid) == null) {
                 if (remove_count < windows_to_remove.len) {
                     windows_to_remove[remove_count] = wid;
                     remove_count += 1;
@@ -1763,7 +1461,7 @@ pub const Daemon = struct {
 
         // Clear stale focused_window_id
         if (self.windows.getFocusedId()) |focused_wid| {
-            if (Window.getSpace(focused_wid) == 0) {
+            if (self.platform.getWindowSpace(focused_wid) == null) {
                 self.windows.setFocused(null);
             }
         }
@@ -1816,10 +1514,10 @@ pub const Daemon = struct {
 
         // Re-enable event tap if it got disabled
         if (self.config.focus_follows_mouse != .disabled) {
-            if (self.mouse_event_tap) |tap| {
-                if (!c.c.CGEventTapIsEnabled(tap)) {
+            if (self.mouse_tap.tap != null) {
+                if (!self.mouse_tap.isEnabled()) {
                     log.warn("validation: re-enabling disabled event tap", .{});
-                    c.c.CGEventTapEnable(tap, true);
+                    self.mouse_tap.reenable();
                 }
             } else {
                 log.warn("validation: event tap is null, attempting to recreate", .{});
@@ -1909,8 +1607,6 @@ pub const Daemon = struct {
     /// 8. Restore focus to original space
     pub fn startApplicationTracking(self: *Self) void {
         instance = self;
-        const span = trace.begin("startup", .event);
-        defer span.end();
 
         log.info("startup: unified sync starting", .{});
 
@@ -1923,7 +1619,7 @@ pub const Daemon = struct {
             defer if (displays.len > 0) self.allocator.free(displays);
             for (displays, 0..) |did, i| {
                 if (i >= 8) break;
-                original_spaces[i] = Display.getCurrentSpace(did) orelse 0;
+                original_spaces[i] = self.platform.getActiveSpaceForDisplay(did) orelse 0;
                 display_count += 1;
             }
         }
@@ -1942,10 +1638,10 @@ pub const Daemon = struct {
                     const orig_sid = original_spaces[i];
                     if (orig_sid == 0) continue;
 
-                    const current_sid = Display.getCurrentSpace(did) orelse continue;
+                    const current_sid = self.platform.getActiveSpaceForDisplay(did) orelse continue;
                     if (current_sid != orig_sid) {
                         // Space was valid before, may have been destroyed - check if still exists
-                        if (Space.isUser(orig_sid)) {
+                        if (self.platform.getSpaceType(orig_sid) == .user) {
                             if (sa.focusSpace(orig_sid)) {
                                 log.info("startup: restored display {} to space {}", .{ did, orig_sid });
                             }
@@ -2125,7 +1821,7 @@ pub const Daemon = struct {
                     const label_idx = self.findLabelIndex(space_label);
                     if (label_idx != null and !target.assigned_labels.isSet(label_idx.?)) {
                         // Check if this space is on the right display for this label
-                        const space_display = Space.getDisplayId(space_id);
+                        const space_display = self.platform.getSpaceDisplay(space_id);
                         const target_display = self.getTargetDisplayForLabel(target, space_label);
 
                         if (space_display != null and target_display != null and space_display.? == target_display.?) {
@@ -2178,13 +1874,13 @@ pub const Daemon = struct {
             if (want == 0) continue;
 
             // Get current user spaces
-            const display_spaces = Display.getSpaceList(self.allocator, did) catch continue;
+            const display_spaces = self.platform.getDisplaySpaces(self.allocator, did) orelse continue;
             defer self.allocator.free(display_spaces);
 
             var user_spaces: [32]u64 = undefined;
             var have: usize = 0;
             for (display_spaces) |sid| {
-                if (Space.isUser(sid) and have < 32) {
+                if (self.platform.getSpaceType(sid) == .user and have < 32) {
                     user_spaces[have] = sid;
                     have += 1;
                 }
@@ -2265,13 +1961,13 @@ pub const Daemon = struct {
             const did = target.display_ids[di];
 
             // Get user spaces in order
-            const display_spaces = Display.getSpaceList(self.allocator, did) catch continue;
+            const display_spaces = self.platform.getDisplaySpaces(self.allocator, did) orelse continue;
             defer self.allocator.free(display_spaces);
 
             var user_spaces: [32]u64 = undefined;
             var user_count: usize = 0;
             for (display_spaces) |sid| {
-                if (Space.isUser(sid) and user_count < 32) {
+                if (self.platform.getSpaceType(sid) == .user and user_count < 32) {
                     user_spaces[user_count] = sid;
                     user_count += 1;
                 }
@@ -2388,21 +2084,11 @@ pub const Daemon = struct {
         while (it.next()) |entry| {
             const wid = entry.key_ptr.*;
             const old_space = entry.value_ptr.space_id;
-            const queried_space = Window.getSpace(wid);
-            const display_space = Window.getDisplaySpace(wid);
-            const geometry_space = Window.getSpaceByGeometry(wid);
 
-            // After display hotplug, SkyLight APIs may return stale data.
-            // Trust geometry-based detection first (where the window actually is on screen),
-            // then fall back to display's current space, then queried space.
-            const new_space = if (geometry_space != 0)
-                geometry_space
-            else if (display_space != 0 and display_space != queried_space)
-                display_space
-            else
-                queried_space;
+            // Query current space from platform
+            const new_space = self.platform.getWindowSpace(wid) orelse continue;
 
-            log.debug("refreshWindowSpaceIds: wid={} old={} queried={} display={} geometry={} -> {}", .{ wid, old_space, queried_space, display_space, geometry_space, new_space });
+            log.debug("refreshWindowSpaceIds: wid={} old={} new={}", .{ wid, old_space, new_space });
 
             if (new_space != 0 and new_space != old_space) {
                 log.info("sync: window {} moved from space {} to {}", .{ wid, old_space, new_space });
@@ -2497,11 +2183,10 @@ pub const Daemon = struct {
             if (win_ref == null) continue;
 
             const wid = Application.getWindowId(win_ref) orelse continue;
-            const space_id = Window.getSpace(wid);
-            if (space_id == 0) {
+            const space_id = self.platform.getWindowSpace(wid) orelse {
                 log.debug("startup: {s} wid={} has no space", .{ app_name, wid });
                 continue;
-            }
+            };
 
             // Check if managed (respect manage=false rules, but don't move)
             var should_manage = self.shouldManageWindow(win_ref);
@@ -2594,13 +2279,13 @@ pub const Daemon = struct {
         defer self.allocator.free(displays);
 
         for (displays) |did| {
-            const current_sid = Display.getCurrentSpace(did) orelse continue;
+            const current_sid = self.platform.getActiveSpaceForDisplay(did) orelse continue;
 
             // If current space has windows, keep it
             if (self.windows.getWindowsForSpace(current_sid).len > 0) continue;
 
             // Find a space on this display that has windows
-            const display_spaces = Display.getSpaceList(self.allocator, did) catch continue;
+            const display_spaces = self.platform.getDisplaySpaces(self.allocator, did) orelse continue;
             defer self.allocator.free(display_spaces);
 
             for (display_spaces) |sid| {
@@ -2617,24 +2302,14 @@ pub const Daemon = struct {
 
     /// Layout only currently visible spaces
     fn layoutVisibleSpaces(self: *Self) void {
-        const displays = Displays.getActiveDisplayList(self.allocator) catch return;
-        defer self.allocator.free(displays);
-
-        for (displays) |did| {
-            const sid = Display.getCurrentSpace(did) orelse continue;
-            const bounds = self.getBoundsForSpace(sid) orelse continue;
-            self.spaces.applyLayout(sid, bounds, &self.windows) catch |err| {
-                log.warn("layout failed for space {}: {}", .{ sid, err });
-            };
-        }
-
-        // Second pass after delay for stubborn windows
-        std.Thread.sleep(100 * std.time.ns_per_ms);
-        for (displays) |did| {
-            const sid = Display.getCurrentSpace(did) orelse continue;
-            const bounds = self.getBoundsForSpace(sid) orelse continue;
-            self.spaces.applyLayout(sid, bounds, &self.windows) catch {};
-        }
+        daemon_layout.layoutVisibleSpaces(
+            self.allocator,
+            self.platform,
+            &self.spaces,
+            &self.windows,
+            &self.displays,
+            &self.config,
+        );
     }
 
     /// Match physical displays to config labels (builtin/external)
@@ -2696,7 +2371,7 @@ pub const Daemon = struct {
         var user_spaces: [64]u64 = undefined;
         var user_count: usize = 0;
         for (spaces) |sid| {
-            if (Space.isUser(sid) and user_count < 64) {
+            if (self.platform.getSpaceType(sid) == .user and user_count < 64) {
                 user_spaces[user_count] = sid;
                 user_count += 1;
             }
@@ -2729,7 +2404,7 @@ pub const Daemon = struct {
             var updated_user_spaces: [64]u64 = undefined;
             var updated_count: usize = 0;
             for (updated_spaces) |sid| {
-                if (Space.isUser(sid) and updated_count < 64) {
+                if (self.platform.getSpaceType(sid) == .user and updated_count < 64) {
                     updated_user_spaces[updated_count] = sid;
                     updated_count += 1;
                 }
@@ -2743,7 +2418,7 @@ pub const Daemon = struct {
                 const sid = updated_user_spaces[idx];
 
                 // Only remove empty spaces
-                const windows = Space.getWindowList(self.allocator, sid, true) catch continue;
+                const windows = self.platform.getSpaceWindows(self.allocator, sid) orelse continue;
                 defer self.allocator.free(windows);
                 if (windows.len > 0) {
                     log.info("space sync: keeping space {d} (has {d} windows)", .{ sid, windows.len });
@@ -2776,7 +2451,7 @@ pub const Daemon = struct {
 
         // First pass: assign spaces to their preferred displays
         for (displays) |did| {
-            const display_spaces = Display.getSpaceList(self.allocator, did) catch continue;
+            const display_spaces = self.platform.getDisplaySpaces(self.allocator, did) orelse continue;
             defer self.allocator.free(display_spaces);
 
             // Get display label (if any)
@@ -2786,7 +2461,7 @@ pub const Daemon = struct {
             var user_spaces: [32]u64 = undefined;
             var user_count: usize = 0;
             for (display_spaces) |sid| {
-                if (Space.isUser(sid) and user_count < 32) {
+                if (self.platform.getSpaceType(sid) == .user and user_count < 32) {
                     user_spaces[user_count] = sid;
                     user_count += 1;
                 }
@@ -2838,7 +2513,7 @@ pub const Daemon = struct {
             while (fallback_idx < all_spaces.len) {
                 const sid = all_spaces[fallback_idx];
                 fallback_idx += 1;
-                if (!Space.isUser(sid)) continue;
+                if (self.platform.getSpaceType(sid) != .user) continue;
                 if (self.spaces.getLabelForSpace(sid) != null) continue;
 
                 // Found an unlabeled space - assign this config space to it
@@ -2867,34 +2542,14 @@ pub const Daemon = struct {
 
     /// Apply layout to visible spaces (current space on each display)
     fn applyAllSpaceLayouts(self: *Self) void {
-        // Get all active displays
-        const displays = Displays.getActiveDisplayList(self.allocator) catch return;
-        defer self.allocator.free(displays);
-
-        // Apply layout to the current space on each display
-        for (displays) |did| {
-            const sid = Display.getCurrentSpace(did) orelse continue;
-            const bounds = self.getBoundsForSpace(sid) orelse continue;
-
-            self.spaces.applyLayout(sid, bounds, &self.windows) catch |err| {
-                log.warn("applyAllSpaceLayouts: failed for space {}: {}", .{ sid, err });
-                continue;
-            };
-            log.info("applied layout to space {}", .{sid});
-        }
-
-        // Wait for macOS/apps to settle, then apply again
-        std.Thread.sleep(200 * std.time.ns_per_ms);
-        log.debug("applyAllSpaceLayouts: second pass after delay", .{});
-
-        for (displays) |did| {
-            const sid = Display.getCurrentSpace(did) orelse continue;
-            const bounds = self.getBoundsForSpace(sid) orelse continue;
-
-            self.spaces.applyLayout(sid, bounds, &self.windows) catch |err| {
-                log.warn("applyAllSpaceLayouts: second pass failed for space {}: {}", .{ sid, err });
-            };
-        }
+        daemon_layout.applyAllSpaceLayouts(
+            self.allocator,
+            self.platform,
+            &self.spaces,
+            &self.windows,
+            &self.displays,
+            &self.config,
+        );
     }
 
     /// Add an application to tracking and start observing
@@ -2972,11 +2627,10 @@ pub const Daemon = struct {
             };
 
             // Get the space this window is actually on
-            const space_id = Window.getSpace(wid);
-            if (space_id == 0) {
-                if (app_name) |name| log.debug("addApplicationWindows: {s} wid={} has space_id=0, skipping", .{ name, wid });
+            const space_id = self.platform.getWindowSpace(wid) orelse {
+                if (app_name) |name| log.debug("addApplicationWindows: {s} wid={} has no space, skipping", .{ name, wid });
                 continue;
-            }
+            };
 
             // Check if managed (rules check manage flag, but don't move during startup)
             var should_manage = self.shouldManageWindow(win_ref);
@@ -3008,7 +2662,7 @@ pub const Daemon = struct {
 
                     // Apply opacity
                     if (rule.opacity) |opacity| {
-                        Window.setOpacity(wid, opacity) catch {};
+                        _ = self.platform.setWindowOpacity(wid, opacity);
                     }
 
                     // Apply layer
@@ -3018,7 +2672,7 @@ pub const Daemon = struct {
                             .normal => self.layer_normal,
                             .above => self.layer_above,
                         };
-                        Window.setLevel(wid, level) catch {};
+                        _ = self.platform.setWindowLevel(wid, level);
                     }
                 }
             }
@@ -3064,35 +2718,7 @@ pub const Daemon = struct {
 
     /// Check if a window should be managed (tiled)
     fn shouldManageWindow(_: *Self, win_ref: c.AXUIElementRef) bool {
-
-        // Check role
-        const role_ref = ax.copyAttributeValue(win_ref, ax.Attr.role) catch return false;
-        defer c.c.CFRelease(role_ref);
-
-        // Must be a window
-        const role_str: c.CFStringRef = @ptrCast(role_ref);
-        if (!ax.cfStringEquals(role_str, ax.Role.window)) {
-            return false;
-        }
-
-        // Check subrole - only manage standard windows
-        if (ax.copyAttributeValue(win_ref, ax.Attr.subrole)) |subrole_ref| {
-            defer c.c.CFRelease(subrole_ref);
-            const subrole_str: c.CFStringRef = @ptrCast(subrole_ref);
-
-            // Skip dialogs, system dialogs, floating windows
-            if (!ax.cfStringEquals(subrole_str, ax.Subrole.standard_window)) {
-                return false;
-            }
-        } else |_| {}
-
-        // Check minimized
-        if (ax.copyAttributeValue(win_ref, ax.Attr.minimized)) |min_ref| {
-            defer c.c.CFRelease(min_ref);
-            if (ax.extractBool(min_ref)) return false;
-        } else |_| {}
-
-        return true;
+        return daemon_events.shouldManageWindow(win_ref);
     }
 
     /// Remove an application from tracking
@@ -3132,9 +2758,6 @@ pub const Daemon = struct {
                 return;
             };
 
-            const span = trace.beginArgs("window_created", .window, .{ .wid = wid });
-            defer span.end();
-
             log.debug("window created notification: wid={d}", .{wid});
 
             // Get pid and app name for rule matching
@@ -3147,8 +2770,7 @@ pub const Daemon = struct {
             const app_name: ?[]const u8 = if (name_len > 0) app_name_buf[0..@intCast(name_len)] else null;
 
             // Get window's current space
-            var space_id = Window.getSpace(wid);
-            if (space_id == 0) space_id = self.getCurrentSpaceId() orelse return;
+            var space_id = self.platform.getWindowSpace(wid) orelse self.getCurrentSpaceId() orelse return;
 
             // Apply rules to determine management and target space
             var should_manage = self.shouldManageWindow(element);
@@ -3175,7 +2797,7 @@ pub const Daemon = struct {
                     }
 
                     if (rule.opacity) |opacity| {
-                        Window.setOpacity(wid, opacity) catch {};
+                        _ = self.platform.setWindowOpacity(wid, opacity);
                     }
 
                     if (rule.layer) |layer| {
@@ -3184,7 +2806,7 @@ pub const Daemon = struct {
                             .normal => self.layer_normal,
                             .above => self.layer_above,
                         };
-                        Window.setLevel(wid, level) catch {};
+                        _ = self.platform.setWindowLevel(wid, level);
                     }
                 }
             }
@@ -3232,9 +2854,6 @@ pub const Daemon = struct {
             // Window destroyed - get wid from refcon since element is now invalid
             const wid: u32 = @intCast(@intFromPtr(refcon));
 
-            const span = trace.beginArgs("window_destroyed", .window, .{ .wid = wid });
-            defer span.end();
-
             log.debug("window destroyed notification: wid={d} (from refcon)", .{wid});
 
             if (wid == 0) return;
@@ -3252,8 +2871,6 @@ pub const Daemon = struct {
             // Window minimized - update flag (layout will exclude it)
             const wid = Application.getWindowId(element) orelse return;
 
-            trace.instant("window_minimized", .window, .{ .wid = wid });
-
             // Update minimized flag in Windows
             self.windows.setMinimized(wid, true);
 
@@ -3264,8 +2881,6 @@ pub const Daemon = struct {
         } else if (c.c.CFStringCompare(notification, deminimized, 0) == c.c.kCFCompareEqualTo) {
             // Window deminimized - update flag and re-layout
             const wid = Application.getWindowId(element) orelse return;
-
-            trace.instant("window_deminimized", .window, .{ .wid = wid });
 
             if (!self.shouldManageWindow(element)) return;
 
@@ -3280,8 +2895,6 @@ pub const Daemon = struct {
         } else if (c.c.CFStringCompare(notification, focus_changed, 0) == c.c.kCFCompareEqualTo) {
             // Window focus changed - update tracking and handle mouse warp
             const wid = Application.getWindowId(element) orelse return;
-
-            trace.instant("window_focus", .window, .{ .wid = wid });
 
             // Update focused window tracking
             self.windows.setFocused(wid);
@@ -3372,9 +2985,9 @@ pub const Daemon = struct {
         // Get window's current space - prefer current space since we can see it via AX
         // SkyLight APIs can return stale data during space transitions
         const current_space = self.getCurrentSpaceId() orelse return;
-        var space_id = Window.getSpace(wid);
-        if (space_id == 0 or space_id != current_space) {
-            // If SkyLight disagrees or returns 0, trust current space since we can see window via AX
+        var space_id = self.platform.getWindowSpace(wid) orelse current_space;
+        if (space_id != current_space) {
+            // If SkyLight disagrees, trust current space since we can see window via AX
             space_id = current_space;
         }
 
@@ -3397,7 +3010,7 @@ pub const Daemon = struct {
                 // Space rules are only applied during initial app launch
 
                 if (rule.opacity) |opacity| {
-                    Window.setOpacity(wid, opacity) catch {};
+                    _ = self.platform.setWindowOpacity(wid, opacity);
                 }
 
                 if (rule.layer) |layer| {
@@ -3406,7 +3019,7 @@ pub const Daemon = struct {
                         .normal => self.layer_normal,
                         .above => self.layer_above,
                     };
-                    Window.setLevel(wid, level) catch {};
+                    _ = self.platform.setWindowLevel(wid, level);
                 }
             }
         }
@@ -3494,11 +3107,12 @@ pub const Daemon = struct {
 // Tests
 // ============================================================================
 
-test "Daemon path formatting" {
-    // Can't fully test without proper environment, but we can test the struct exists
-    const d = Daemon{
-        .allocator = std.testing.allocator,
-        .skylight = undefined,
-    };
-    _ = d;
+test "Daemon struct exists" {
+    // Can't fully test without proper environment, but we can verify sub-modules compile
+    // The actual Daemon requires skylight, lock files, etc.
+}
+
+// Pull in tests from sub-modules
+test {
+    _ = daemon_layout;
 }
