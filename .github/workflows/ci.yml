@@ -26,5 +26,8 @@ jobs:
       - name: Build
         run: zig build
 
+      - name: Sign (ad-hoc)
+        run: zig build sign-adhoc
+
       - name: Run tests
         run: zig build test

@@ -89,6 +89,21 @@ pub fn build(b: *std.Build) void {
     const sign_step = b.step("sign", "Sign binary with yabai.zig-cert (for accessibility)");
     sign_step.dependOn(&sign_cmd.step);
 
+    // Ad-hoc sign step - for CI/releases (no certificate required)
+    const adhoc_sign_cmd = b.addSystemCommand(&.{
+        "/usr/bin/codesign",
+        "-f",
+        "-s",
+        "-", // ad-hoc signature
+        "-i",
+        "com.stoffeastrom.yabai.zig",
+    });
+    adhoc_sign_cmd.addArtifactArg(exe);
+    adhoc_sign_cmd.step.dependOn(b.getInstallStep());
+
+    const adhoc_sign_step = b.step("sign-adhoc", "Ad-hoc sign binary (for CI/releases)");
+    adhoc_sign_step.dependOn(&adhoc_sign_cmd.step);
+
     // Run step (without signing - use for development/testing)
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
