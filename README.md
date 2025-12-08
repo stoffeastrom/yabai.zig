@@ -31,6 +31,10 @@ Work in progress. Core features work:
 # Build
 zig build
 
+# First time: create signing certificate (for stable accessibility permissions)
+./zig-out/bin/yabai.zig --install-cert
+./zig-out/bin/yabai.zig --sign
+
 # Install service
 ./zig-out/bin/yabai.zig --install-service
 
@@ -59,6 +63,8 @@ sudo ./zig-out/bin/yabai.zig --load-sa
 
 # Other
 --check-sa           Verify SA pattern matching works
+--install-cert       Create code signing certificate (one time)
+--sign               Sign binary with certificate
 -m <domain> <cmd>    Send message to running instance
 ```
 
