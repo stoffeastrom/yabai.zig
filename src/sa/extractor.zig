@@ -346,19 +346,23 @@ pub fn discoverFunctions(allocator: std.mem.Allocator, binary_data: []const u8) 
             const func_text_offset = func.file_offset - text.offset;
             const global_refs = macho.findGlobalRefsInFunction(func_text_offset, 200);
 
-            // The first global ref found is likely what we want
-            // (This is a heuristic - may need refinement)
+            // Look for refs that point to __data or __bss sections (high DATA addresses)
+            // __data starts at ~0x10043d1a0, __bss at ~0x10044af70
+            // Skip refs to __objc_const, __objc_selrefs, __objc_ivar, __objc_data
             for (global_refs) |maybe_ref| {
                 if (maybe_ref) |ref| {
-                    if (!result.functions[idx].found) {
-                        result.diagnostics[idx].method = "global ref via selector";
-                        result.functions[idx] = .{
-                            .func = entry.target,
-                            .found = true,
-                            .address = ref.address,
-                            .file_offset = ref.address - 0x100000000, // Convert vmaddr to file offset estimate
-                        };
-                        break;
+                    // Filter: must be in __data/__bss range (0x10043d000+)
+                    if (ref.address >= 0x10043d000 and ref.address < 0x100500000) {
+                        if (!result.functions[idx].found) {
+                            result.diagnostics[idx].method = "global ref via selector";
+                            result.functions[idx] = .{
+                                .func = entry.target,
+                                .found = true,
+                                .address = ref.address,
+                                .file_offset = ref.address - 0x100000000, // Convert vmaddr to file offset estimate
+                            };
+                            break;
+                        }
                     }
                 }
             }

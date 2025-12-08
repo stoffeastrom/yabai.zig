@@ -11,6 +11,32 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // SA Payload - arm64e dylib for Dock injection (must use clang)
+    // Build this first so we can embed it in the main binary
+    const payload_cmd = b.addSystemCommand(&.{
+        "xcrun", "clang",
+    });
+    payload_cmd.addFileArg(b.path("src/sa/payload.m")); // Track as input dependency
+    payload_cmd.addArgs(&.{
+        "-shared",
+        "-fPIC",
+        "-O2",
+        "-mmacosx-version-min=14.0",
+        "-arch",
+        "arm64e",
+        "-framework",
+        "Foundation",
+        "-framework",
+        "CoreFoundation",
+        "-framework",
+        "CoreGraphics",
+        "-F/System/Library/PrivateFrameworks",
+        "-framework",
+        "SkyLight",
+        "-o",
+    });
+    const payload_output = payload_cmd.addOutputFileArg("libyabai.zig-sa.dylib");
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -19,6 +45,11 @@ pub fn build(b: *std.Build) void {
 
     linkFrameworks(exe_mod);
     exe_mod.linkSystemLibrary("c", .{});
+
+    // Embed the SA payload dylib into the binary
+    exe_mod.addAnonymousImport("sa_payload", .{
+        .root_source_file = payload_output,
+    });
 
     const exe = b.addExecutable(.{
         .name = "yabai.zig",
@@ -29,24 +60,6 @@ pub fn build(b: *std.Build) void {
     exe.addAssemblyFile(b.path("resources/embed_plist.s"));
 
     b.installArtifact(exe);
-
-    // SA Payload - arm64e dylib for Dock injection (must use clang)
-    const payload_cmd = b.addSystemCommand(&.{
-        "xcrun",                     "clang",
-        "src/sa/payload.m",          "-shared",
-        "-fPIC",                     "-O2",
-        "-mmacosx-version-min=14.0", "-arch",
-        "arm64e",                    "-framework",
-        "Foundation",                "-framework",
-        "CoreFoundation",            "-framework",
-        "CoreGraphics",              "-F/System/Library/PrivateFrameworks",
-        "-framework",                "SkyLight",
-        "-o",
-    });
-    const payload_output = payload_cmd.addOutputFileArg("libyabai.zig-sa.dylib");
-
-    const install_payload = b.addInstallLibFile(payload_output, "libyabai.zig-sa.dylib");
-    b.getInstallStep().dependOn(&install_payload.step);
 
     // SA Loader - arm64e binary for injection (must use clang for PAC support)
     const loader_cmd = b.addSystemCommand(&.{
@@ -61,7 +74,7 @@ pub fn build(b: *std.Build) void {
     const install_loader = b.addInstallBinFile(loader_output, "yabai.zig-sa-loader");
     b.getInstallStep().dependOn(&install_loader.step);
 
-    // Codesign step - signs with yabai.zig-cert if available
+    // Sign step - signs main binary for stable TCC identity
     const sign_cmd = b.addSystemCommand(&.{
         "/usr/bin/codesign",
         "-f",
@@ -73,28 +86,18 @@ pub fn build(b: *std.Build) void {
     sign_cmd.addArtifactArg(exe);
     sign_cmd.step.dependOn(b.getInstallStep());
 
-    const sign_step = b.step("sign", "Sign binary with yabai.zig-cert (required for accessibility)");
-    sign_step.dependOn(&sign_cmd.step);
+    // Make sign the default step (runs after install)
+    b.default_step = &sign_cmd.step;
 
-    // Run step (without signing - use --debug to skip accessibility check)
+    // Run step
     const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
+    run_cmd.step.dependOn(&sign_cmd.step);
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
 
     const run_step = b.step("run", "Run yabai.zig");
     run_step.dependOn(&run_cmd.step);
-
-    // Run with signing
-    const run_signed_cmd = b.addRunArtifact(exe);
-    run_signed_cmd.step.dependOn(&sign_cmd.step);
-    if (b.args) |args| {
-        run_signed_cmd.addArgs(args);
-    }
-
-    const run_signed_step = b.step("run-signed", "Sign and run yabai.zig (for accessibility)");
-    run_signed_step.dependOn(&run_signed_cmd.step);
 
     // Dev helper - stops yabai, runs yabai.zig, restarts yabai on exit
     const dev_mod = b.createModule(.{
@@ -109,7 +112,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(dev_exe);
 
     const dev_run = b.addRunArtifact(dev_exe);
-    dev_run.step.dependOn(&sign_cmd.step); // Sign main exe first
+    dev_run.step.dependOn(b.getInstallStep()); // Main exe built and signed
     dev_run.step.dependOn(&dev_exe.step); // Build dev helper
     if (b.args) |args| {
         dev_run.addArgs(args);

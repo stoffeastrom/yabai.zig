@@ -109,6 +109,70 @@ pub const Client = struct {
         return self.send(buf[0..total_len]);
     }
 
+    /// Response buffer for operations that return data
+    const ResponseBuf = struct {
+        data: [64]u8 = undefined,
+        len: usize = 0,
+    };
+
+    /// Send a message and receive a multi-byte response
+    fn sendMessageWithResponse(self: *const Client, opcode: Opcode, payload: []const u8) ?[]const u8 {
+        const socket_path = self.getSocketPath();
+
+        // Create socket
+        const sockfd = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch |err| {
+            log.debug("SA sendWithResponse: socket create failed: {}", .{err});
+            return null;
+        };
+        defer std.posix.close(sockfd);
+
+        // Set socket timeout
+        const timeout = std.posix.timeval{ .sec = 1, .usec = 0 };
+        std.posix.setsockopt(sockfd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+        std.posix.setsockopt(sockfd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+
+        // Connect to SA socket
+        var addr: std.posix.sockaddr.un = .{ .family = std.posix.AF.UNIX, .path = undefined };
+        @memset(&addr.path, 0);
+        const path_len = @min(socket_path.len, addr.path.len - 1);
+        @memcpy(addr.path[0..path_len], socket_path[0..path_len]);
+
+        std.posix.connect(sockfd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) catch |err| {
+            log.debug("SA sendWithResponse: connect failed: {}", .{err});
+            return null;
+        };
+
+        // Build message
+        var buf: [0x1000]u8 = undefined;
+        const total_len = 2 + 1 + payload.len;
+        const msg_len: i16 = @intCast(1 + payload.len);
+
+        std.mem.writeInt(i16, buf[0..2], msg_len, .little);
+        buf[2] = @intFromEnum(opcode);
+        if (payload.len > 0) {
+            @memcpy(buf[3..][0..payload.len], payload);
+        }
+
+        // Send message
+        _ = std.posix.send(sockfd, buf[0..total_len], 0) catch |err| {
+            log.debug("SA sendWithResponse: send failed: {}", .{err});
+            return null;
+        };
+
+        // Receive response (up to 64 bytes)
+        const response = &response_buf;
+        response.len = std.posix.recv(sockfd, &response.data, 0) catch |err| {
+            log.debug("SA sendWithResponse: recv failed: {}", .{err});
+            return null;
+        };
+
+        if (response.len == 0) return null;
+        return response.data[0..response.len];
+    }
+
+    // Thread-local response buffer to avoid returning stack pointer
+    threadlocal var response_buf: ResponseBuf = .{};
+
     // ========================================================================
     // Configuration - send discovered addresses to payload
     // ========================================================================
@@ -135,16 +199,37 @@ pub const Client = struct {
     // ========================================================================
 
     /// Create a new space on the same display as the given space
-    pub fn createSpace(self: *const Client, sid: u64) bool {
+    /// Returns the new space ID on success, null on failure
+    pub fn createSpace(self: *const Client, sid: u64) ?u64 {
         var payload: [8]u8 = undefined;
         std.mem.writeInt(u64, &payload, sid, .little);
-        const result = self.sendMessage(.space_create, &payload);
-        if (result) {
-            log.info("created space on display of space {d}", .{sid});
-        } else {
-            log.warn("failed to create space", .{});
+        const response = self.sendMessageWithResponse(.space_create, &payload) orelse {
+            log.warn("failed to create space (no response)", .{});
+            return null;
+        };
+        if (response.len >= 8) {
+            const result = std.mem.readInt(u64, response[0..8], .little);
+            // Decode diagnostic codes from payload
+            const diag = result >> 60;
+            if (diag == 0x1) {
+                log.warn("SA: no g_dock_spaces", .{});
+                return null;
+            } else if (diag == 0x2) {
+                log.warn("SA: no g_add_space_fp", .{});
+                return null;
+            } else if (diag == 0x3) {
+                log.warn("SA: no display_uuid for sid={}", .{sid});
+                return null;
+            } else if (diag == 0x4) {
+                log.warn("SA: space count unchanged (before=after={}), add_space call failed", .{result & 0xFFFFFFFF});
+                return null;
+            } else if (result != 0) {
+                log.info("created space {d} on display of space {d}", .{ result, sid });
+                return result;
+            }
         }
-        return result;
+        log.warn("failed to create space (response=0x{x} len={d})", .{ if (response.len >= 8) std.mem.readInt(u64, response[0..8], .little) else 0, response.len });
+        return null;
     }
 
     /// Destroy a space
@@ -168,11 +253,12 @@ pub const Client = struct {
     }
 
     /// Move space after another space
-    pub fn moveSpaceAfterSpace(self: *const Client, src_sid: u64, dst_sid: u64, focus: bool) bool {
+    /// prev_sid: If source space is active, switch to this space first (0 = source not active)
+    pub fn moveSpaceAfterSpace(self: *const Client, src_sid: u64, dst_sid: u64, prev_sid: u64, focus: bool) bool {
         var payload: [25]u8 = undefined;
         std.mem.writeInt(u64, payload[0..8], src_sid, .little);
         std.mem.writeInt(u64, payload[8..16], dst_sid, .little);
-        std.mem.writeInt(u64, payload[16..24], 0, .little); // dummy_sid
+        std.mem.writeInt(u64, payload[16..24], prev_sid, .little);
         payload[24] = if (focus) 1 else 0;
         return self.sendMessage(.space_move, &payload);
     }

@@ -40,6 +40,7 @@ pub const Context = struct {
     // Callbacks for operations that need daemon-level access
     applyLayout: *const fn (ctx: *Context, space_id: u64) void,
     getBoundsForSpace: *const fn (ctx: *Context, space_id: u64) ?geometry.Rect,
+    markSpaceDirty: *const fn (ctx: *Context, space_id: u64) void,
 };
 
 /// Result of command execution
@@ -95,7 +96,6 @@ pub fn execute(ctx: *Context, cmd: Message.Command) Result {
         .window_ratio,
         .window_insert,
         .window_grid,
-        .space_move,
         .space_swap,
         .space_display,
         .space_mirror,
@@ -110,6 +110,8 @@ pub fn execute(ctx: *Context, cmd: Message.Command) Result {
         .signal_remove,
         .signal_list,
         => .{ .err = Response.errWithDetail(.unknown_command, "not implemented") },
+
+        .space_move => |m| spaceMove(ctx, m.src, m.dst),
 
         // Per-space settings
         .space_padding => |p| spacePadding(ctx, p.space, p.mode, p.top, p.bottom, p.left, p.right),
@@ -787,124 +789,103 @@ fn spaceCreate(ctx: *Context, display_sel: ?Message.DisplaySelector, focus: bool
         return .{ .err = Response.errWithDetail(.skylight_error, "SA not loaded") };
     };
 
-    // Get reference space ID (current space on target display, or focused display)
-    const ref_space = blk: {
+    // Get target display and reference space
+    const target_display = blk: {
         if (display_sel) |sel| {
-            const did = resolveDisplay(ctx, sel) orelse break :blk null;
-            break :blk Display.getCurrentSpace(did);
+            break :blk resolveDisplay(ctx, sel) orelse {
+                return .{ .err = Response.err(.invalid_selector) };
+            };
         }
-        // Default: use current space on main display
-        const main_display = Displays.getMainDisplayId();
-        break :blk Display.getCurrentSpace(main_display);
-    } orelse {
+        break :blk Displays.getMainDisplayId();
+    };
+
+    const ref_space = Display.getCurrentSpace(target_display) orelse {
         return .{ .err = Response.err(.space_not_found) };
     };
 
     // Get focused window before creating space (for --take)
-    // Try our tracked state first, fall back to querying system
     const focused_wid: ?Window.Id = if (take) blk: {
         if (ctx.windows.getFocusedId()) |wid| break :blk wid;
-        // Query system for focused window
         break :blk getSystemFocusedWindow();
     } else null;
 
-    // Get space count before create to detect new space
-    const old_last = getLastSpaceOnDisplay(ctx, ref_space);
+    // Get spaces before creation to find the new one
+    const spaces_before = Display.getSpaceList(ctx.allocator, target_display) catch {
+        return .{ .err = Response.err(.skylight_error) };
+    };
+    defer ctx.allocator.free(spaces_before);
 
-    if (!sa.createSpace(ref_space)) {
+    // Create space - SA returns the new space ID directly
+    const new_sid_from_sa = sa.createSpace(ref_space);
+    if (new_sid_from_sa == null) {
         return .{ .err = Response.errWithDetail(.skylight_error, "SA create failed") };
     }
 
-    // Brief pause to let macOS update space list
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    log.info("created space {} on display {}", .{ new_sid_from_sa.?, target_display });
 
-    // Get the newly created space (last space on the display)
-    const new_space_id = getLastSpaceOnDisplay(ctx, ref_space);
+    // For --focus and --take, use the ID from SA (with polling fallback)
+    if (focus or take) {
+        var new_sid: ?Space.Id = new_sid_from_sa;
 
-    // Verify we actually got a new space
-    if (new_space_id != null and old_last != null and new_space_id.? == old_last.?) {
-        log.warn("space create: new space ID same as old ({?}), timing issue?", .{new_space_id});
-    }
+        // If SA returned 0, fall back to polling
+        if (new_sid == null or new_sid.? == 0) {
+            new_sid = null;
+            for (0..10) |attempt| {
+                std.Thread.sleep(100 * std.time.ns_per_ms);
 
-    if (new_space_id) |new_sid| {
-        // Move window to new space if --take
-        if (take) {
-            if (focused_wid) |wid| {
-                Space.moveWindows(&[_]u32{wid}, new_sid) catch {};
-                ctx.windows.setWindowSpace(wid, new_sid);
-                log.info("moved window {} to new space {}", .{ wid, new_sid });
+                const spaces_after = Display.getSpaceList(ctx.allocator, target_display) catch continue;
+                defer ctx.allocator.free(spaces_after);
+
+                if (attempt == 0) {
+                    log.debug("space create: before={any} after={any}", .{ spaces_before, spaces_after });
+                }
+
+                for (spaces_after) |sid| {
+                    var found = false;
+                    for (spaces_before) |old_sid| {
+                        if (sid == old_sid) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        new_sid = sid;
+                        break;
+                    }
+                }
+
+                if (new_sid != null) break;
             }
         }
 
-        // Focus new space (default behavior)
-        if (focus) {
-            const sl = ctx.skylight;
-            const cid = ctx.connection;
-            const display_uuid = sl.SLSCopyManagedDisplayForSpace(cid, new_sid);
-            if (display_uuid != null) {
-                defer c.c.CFRelease(display_uuid);
-                _ = sl.SLSManagedDisplaySetCurrentSpace(cid, display_uuid, new_sid);
-                log.info("created and focused space {}", .{new_sid});
+        if (new_sid) |sid| {
+            log.info("found new space {}", .{sid});
+
+            // Move window to new space if --take
+            if (take) {
+                if (focused_wid) |wid| {
+                    // Use SA to move window - more reliable than SkyLight during transitions
+                    if (sa.moveWindowToSpace(sid, wid)) {
+                        ctx.windows.setWindowSpace(wid, sid);
+                        log.info("moved window {} to new space {}", .{ wid, sid });
+                    } else {
+                        log.warn("failed to move window {} to new space {}", .{ wid, sid });
+                    }
+                }
+            }
+
+            // Focus new space if requested - the space_changed event will trigger layout
+            if (focus) {
+                if (sa.focusSpace(sid)) {
+                    log.info("focused new space {}", .{sid});
+                }
             }
         } else {
-            log.info("created space {} (no focus)", .{new_sid});
+            log.warn("could not find new space after creation (API delay)", .{});
         }
-    } else {
-        log.info("created space on display of space {}", .{ref_space});
     }
 
     return .{ .ok = "" };
-}
-
-/// Get the last (newest) space on the same display as ref_space
-fn getLastSpaceOnDisplay(ctx: *Context, ref_space: Space.Id) ?Space.Id {
-    const sl = ctx.skylight;
-    const cid = ctx.connection;
-
-    // Get display UUID for reference space
-    const ref_uuid = sl.SLSCopyManagedDisplayForSpace(cid, ref_space);
-    if (ref_uuid == null) return null;
-    defer c.c.CFRelease(ref_uuid);
-
-    // Get all spaces on this display
-    const all_spaces = sl.SLSCopyManagedDisplaySpaces(cid);
-    if (all_spaces == null) return null;
-    defer c.c.CFRelease(all_spaces);
-
-    const display_count: usize = @intCast(c.c.CFArrayGetCount(all_spaces));
-    for (0..display_count) |i| {
-        const display_dict: c.CFDictionaryRef = @ptrCast(c.c.CFArrayGetValueAtIndex(all_spaces, @intCast(i)));
-
-        // Check if this is the right display
-        const uuid_key = c.cfstr("Display Identifier");
-        defer c.c.CFRelease(uuid_key);
-        const display_uuid: c.c.CFStringRef = @ptrCast(c.c.CFDictionaryGetValue(display_dict, uuid_key));
-        if (display_uuid == null) continue;
-
-        if (c.c.CFStringCompare(display_uuid, ref_uuid, 0) != c.c.kCFCompareEqualTo) continue;
-
-        // Found the right display - get last space
-        const spaces_key = c.cfstr("Spaces");
-        defer c.c.CFRelease(spaces_key);
-        const spaces: c.CFArrayRef = @ptrCast(c.c.CFDictionaryGetValue(display_dict, spaces_key));
-        if (spaces == null) continue;
-
-        const space_count: usize = @intCast(c.c.CFArrayGetCount(spaces));
-        if (space_count == 0) continue;
-
-        // Get last space
-        const last_space_dict: c.CFDictionaryRef = @ptrCast(c.c.CFArrayGetValueAtIndex(spaces, @intCast(space_count - 1)));
-        const id_key = c.cfstr("id64");
-        defer c.c.CFRelease(id_key);
-        const sid_ref: c.c.CFNumberRef = @ptrCast(c.c.CFDictionaryGetValue(last_space_dict, id_key));
-        if (sid_ref == null) continue;
-
-        var sid: Space.Id = 0;
-        _ = c.c.CFNumberGetValue(sid_ref, c.c.kCFNumberSInt64Type, &sid);
-        return sid;
-    }
-
-    return null;
 }
 
 /// Get the currently focused window from the system (via accessibility)
@@ -965,6 +946,66 @@ fn spaceDestroy(ctx: *Context, sel: Message.SpaceSelector) Result {
     }
 
     log.info("destroyed space {}", .{space_id});
+    return .{ .ok = "" };
+}
+
+fn spaceMove(ctx: *Context, src_sel: Message.SpaceSelector, dst_sel: Message.SpaceSelector) Result {
+    const sa = ctx.sa_client orelse {
+        return .{ .err = Response.errWithDetail(.skylight_error, "SA not loaded") };
+    };
+
+    const src_space = resolveSpace(ctx, src_sel) orelse {
+        return .{ .err = Response.err(.invalid_selector) };
+    };
+
+    const dst_space = resolveSpace(ctx, dst_sel) orelse {
+        return .{ .err = Response.errWithDetail(.invalid_selector, "target space") };
+    };
+
+    if (src_space == dst_space) {
+        return .{ .ok = "" };
+    }
+
+    // Check if source space is currently focused, and get prev space to focus
+    const cid = ctx.connection;
+    const sl = ctx.skylight;
+    const src_uuid = sl.SLSCopyManagedDisplayForSpace(cid, src_space);
+    if (src_uuid == null) {
+        return .{ .err = Response.err(.space_not_found) };
+    }
+    defer c.c.CFRelease(src_uuid);
+
+    const current_space = sl.SLSManagedDisplayGetCurrentSpace(cid, src_uuid);
+    const source_is_focused = current_space == src_space;
+
+    // If source is focused, we need a fallback space before moving
+    // Find the previous space in the list
+    var prev_space_id: u64 = 0;
+    if (source_is_focused) {
+        const display_id = Display.getId(src_uuid);
+        if (display_id != 0) {
+            const spaces = Display.getSpaceList(ctx.allocator, display_id) catch null;
+            if (spaces) |space_list| {
+                defer ctx.allocator.free(space_list);
+                for (space_list, 0..) |sid, i| {
+                    if (sid == src_space and i > 0) {
+                        prev_space_id = space_list[i - 1];
+                        break;
+                    }
+                }
+                // If first space, use the next one
+                if (prev_space_id == 0 and space_list.len > 1) {
+                    prev_space_id = if (space_list[0] == src_space) space_list[1] else space_list[0];
+                }
+            }
+        }
+    }
+
+    if (!sa.moveSpaceAfterSpace(src_space, dst_space, prev_space_id, false)) {
+        return .{ .err = Response.errWithDetail(.skylight_error, "SA move failed") };
+    }
+
+    log.info("moved space {} after space {} (prev={})", .{ src_space, dst_space, prev_space_id });
     return .{ .ok = "" };
 }
 
@@ -1515,6 +1556,29 @@ fn getVisibleWindowIds(ctx: *Context) ?[]u32 {
 
 const testing = std.testing;
 
+fn makeTestContext(wm: *Windows, sm: *Spaces, dm: *Displays, cfg: *Config) Context {
+    return Context{
+        .allocator = testing.allocator,
+        .skylight = undefined,
+        .connection = 0,
+        .windows = wm,
+        .spaces = sm,
+        .displays = dm,
+        .config = cfg,
+        .applyLayout = struct {
+            fn f(_: *Context, _: u64) void {}
+        }.f,
+        .getBoundsForSpace = struct {
+            fn f(_: *Context, _: u64) ?geometry.Rect {
+                return null;
+            }
+        }.f,
+        .markSpaceDirty = struct {
+            fn f(_: *Context, _: u64) void {}
+        }.f,
+    };
+}
+
 test "configSet layout bsp" {
     var sm = Spaces.init(testing.allocator);
     defer sm.deinit();
@@ -1524,23 +1588,7 @@ test "configSet layout bsp" {
     defer dm.deinit();
     var cfg = Config{};
 
-    var ctx = Context{
-        .allocator = testing.allocator,
-        .skylight = undefined,
-        .connection = 0,
-        .windows = &wm,
-        .spaces = &sm,
-        .displays = &dm,
-        .config = &cfg,
-        .applyLayout = struct {
-            fn f(_: *Context, _: u64) void {}
-        }.f,
-        .getBoundsForSpace = struct {
-            fn f(_: *Context, _: u64) ?geometry.Rect {
-                return null;
-            }
-        }.f,
-    };
+    var ctx = makeTestContext(&wm, &sm, &dm, &cfg);
 
     const result = configSet(&ctx, "layout", "bsp");
     try testing.expectEqual(Result{ .ok = "" }, result);
@@ -1556,23 +1604,7 @@ test "configSet layout stack" {
     defer dm.deinit();
     var cfg = Config{};
 
-    var ctx = Context{
-        .allocator = testing.allocator,
-        .skylight = undefined,
-        .connection = 0,
-        .windows = &wm,
-        .spaces = &sm,
-        .displays = &dm,
-        .config = &cfg,
-        .applyLayout = struct {
-            fn f(_: *Context, _: u64) void {}
-        }.f,
-        .getBoundsForSpace = struct {
-            fn f(_: *Context, _: u64) ?geometry.Rect {
-                return null;
-            }
-        }.f,
-    };
+    var ctx = makeTestContext(&wm, &sm, &dm, &cfg);
 
     const result = configSet(&ctx, "layout", "stack");
     try testing.expectEqual(Result{ .ok = "" }, result);
@@ -1588,23 +1620,7 @@ test "configSet layout float" {
     defer dm.deinit();
     var cfg = Config{};
 
-    var ctx = Context{
-        .allocator = testing.allocator,
-        .skylight = undefined,
-        .connection = 0,
-        .windows = &wm,
-        .spaces = &sm,
-        .displays = &dm,
-        .config = &cfg,
-        .applyLayout = struct {
-            fn f(_: *Context, _: u64) void {}
-        }.f,
-        .getBoundsForSpace = struct {
-            fn f(_: *Context, _: u64) ?geometry.Rect {
-                return null;
-            }
-        }.f,
-    };
+    var ctx = makeTestContext(&wm, &sm, &dm, &cfg);
 
     const result = configSet(&ctx, "layout", "float");
     try testing.expectEqual(Result{ .ok = "" }, result);
@@ -1620,23 +1636,7 @@ test "configSet layout invalid returns error" {
     defer dm.deinit();
     var cfg = Config{};
 
-    var ctx = Context{
-        .allocator = testing.allocator,
-        .skylight = undefined,
-        .connection = 0,
-        .windows = &wm,
-        .spaces = &sm,
-        .displays = &dm,
-        .config = &cfg,
-        .applyLayout = struct {
-            fn f(_: *Context, _: u64) void {}
-        }.f,
-        .getBoundsForSpace = struct {
-            fn f(_: *Context, _: u64) ?geometry.Rect {
-                return null;
-            }
-        }.f,
-    };
+    var ctx = makeTestContext(&wm, &sm, &dm, &cfg);
 
     const result = configSet(&ctx, "layout", "invalid");
     try testing.expect(result == .err);
@@ -1652,23 +1652,7 @@ test "configSet window_gap" {
     defer dm.deinit();
     var cfg = Config{};
 
-    var ctx = Context{
-        .allocator = testing.allocator,
-        .skylight = undefined,
-        .connection = 0,
-        .windows = &wm,
-        .spaces = &sm,
-        .displays = &dm,
-        .config = &cfg,
-        .applyLayout = struct {
-            fn f(_: *Context, _: u64) void {}
-        }.f,
-        .getBoundsForSpace = struct {
-            fn f(_: *Context, _: u64) ?geometry.Rect {
-                return null;
-            }
-        }.f,
-    };
+    var ctx = makeTestContext(&wm, &sm, &dm, &cfg);
 
     const result = configSet(&ctx, "window_gap", "20");
     try testing.expectEqual(Result{ .ok = "" }, result);
@@ -1685,23 +1669,7 @@ test "configSet gap alias" {
     defer dm.deinit();
     var cfg = Config{};
 
-    var ctx = Context{
-        .allocator = testing.allocator,
-        .skylight = undefined,
-        .connection = 0,
-        .windows = &wm,
-        .spaces = &sm,
-        .displays = &dm,
-        .config = &cfg,
-        .applyLayout = struct {
-            fn f(_: *Context, _: u64) void {}
-        }.f,
-        .getBoundsForSpace = struct {
-            fn f(_: *Context, _: u64) ?geometry.Rect {
-                return null;
-            }
-        }.f,
-    };
+    var ctx = makeTestContext(&wm, &sm, &dm, &cfg);
 
     const result = configSet(&ctx, "gap", "15");
     try testing.expectEqual(Result{ .ok = "" }, result);
@@ -1717,23 +1685,7 @@ test "configSet window_gap negative returns error" {
     defer dm.deinit();
     var cfg = Config{};
 
-    var ctx = Context{
-        .allocator = testing.allocator,
-        .skylight = undefined,
-        .connection = 0,
-        .windows = &wm,
-        .spaces = &sm,
-        .displays = &dm,
-        .config = &cfg,
-        .applyLayout = struct {
-            fn f(_: *Context, _: u64) void {}
-        }.f,
-        .getBoundsForSpace = struct {
-            fn f(_: *Context, _: u64) ?geometry.Rect {
-                return null;
-            }
-        }.f,
-    };
+    var ctx = makeTestContext(&wm, &sm, &dm, &cfg);
 
     const result = configSet(&ctx, "window_gap", "-5");
     try testing.expect(result == .err);
@@ -1749,23 +1701,7 @@ test "configSet window_gap non-integer returns error" {
     defer dm.deinit();
     var cfg = Config{};
 
-    var ctx = Context{
-        .allocator = testing.allocator,
-        .skylight = undefined,
-        .connection = 0,
-        .windows = &wm,
-        .spaces = &sm,
-        .displays = &dm,
-        .config = &cfg,
-        .applyLayout = struct {
-            fn f(_: *Context, _: u64) void {}
-        }.f,
-        .getBoundsForSpace = struct {
-            fn f(_: *Context, _: u64) ?geometry.Rect {
-                return null;
-            }
-        }.f,
-    };
+    var ctx = makeTestContext(&wm, &sm, &dm, &cfg);
 
     const result = configSet(&ctx, "window_gap", "abc");
     try testing.expect(result == .err);
@@ -1781,23 +1717,7 @@ test "configSet padding values" {
     defer dm.deinit();
     var cfg = Config{};
 
-    var ctx = Context{
-        .allocator = testing.allocator,
-        .skylight = undefined,
-        .connection = 0,
-        .windows = &wm,
-        .spaces = &sm,
-        .displays = &dm,
-        .config = &cfg,
-        .applyLayout = struct {
-            fn f(_: *Context, _: u64) void {}
-        }.f,
-        .getBoundsForSpace = struct {
-            fn f(_: *Context, _: u64) ?geometry.Rect {
-                return null;
-            }
-        }.f,
-    };
+    var ctx = makeTestContext(&wm, &sm, &dm, &cfg);
 
     _ = configSet(&ctx, "top_padding", "10");
     _ = configSet(&ctx, "bottom_padding", "20");
@@ -1819,23 +1739,7 @@ test "configSet split_ratio" {
     defer dm.deinit();
     var cfg = Config{};
 
-    var ctx = Context{
-        .allocator = testing.allocator,
-        .skylight = undefined,
-        .connection = 0,
-        .windows = &wm,
-        .spaces = &sm,
-        .displays = &dm,
-        .config = &cfg,
-        .applyLayout = struct {
-            fn f(_: *Context, _: u64) void {}
-        }.f,
-        .getBoundsForSpace = struct {
-            fn f(_: *Context, _: u64) ?geometry.Rect {
-                return null;
-            }
-        }.f,
-    };
+    var ctx = makeTestContext(&wm, &sm, &dm, &cfg);
 
     const result = configSet(&ctx, "split_ratio", "0.6");
     try testing.expectEqual(Result{ .ok = "" }, result);
@@ -1851,23 +1755,7 @@ test "configSet split_ratio out of range returns error" {
     defer dm.deinit();
     var cfg = Config{};
 
-    var ctx = Context{
-        .allocator = testing.allocator,
-        .skylight = undefined,
-        .connection = 0,
-        .windows = &wm,
-        .spaces = &sm,
-        .displays = &dm,
-        .config = &cfg,
-        .applyLayout = struct {
-            fn f(_: *Context, _: u64) void {}
-        }.f,
-        .getBoundsForSpace = struct {
-            fn f(_: *Context, _: u64) ?geometry.Rect {
-                return null;
-            }
-        }.f,
-    };
+    var ctx = makeTestContext(&wm, &sm, &dm, &cfg);
 
     const result = configSet(&ctx, "split_ratio", "0.05");
     try testing.expect(result == .err);
@@ -1885,23 +1773,7 @@ test "configSet auto_balance on/off" {
     defer dm.deinit();
     var cfg = Config{};
 
-    var ctx = Context{
-        .allocator = testing.allocator,
-        .skylight = undefined,
-        .connection = 0,
-        .windows = &wm,
-        .spaces = &sm,
-        .displays = &dm,
-        .config = &cfg,
-        .applyLayout = struct {
-            fn f(_: *Context, _: u64) void {}
-        }.f,
-        .getBoundsForSpace = struct {
-            fn f(_: *Context, _: u64) ?geometry.Rect {
-                return null;
-            }
-        }.f,
-    };
+    var ctx = makeTestContext(&wm, &sm, &dm, &cfg);
 
     _ = configSet(&ctx, "auto_balance", "on");
     try testing.expect(sm.auto_balance);
@@ -1925,23 +1797,7 @@ test "configSet unknown key returns error" {
     defer dm.deinit();
     var cfg = Config{};
 
-    var ctx = Context{
-        .allocator = testing.allocator,
-        .skylight = undefined,
-        .connection = 0,
-        .windows = &wm,
-        .spaces = &sm,
-        .displays = &dm,
-        .config = &cfg,
-        .applyLayout = struct {
-            fn f(_: *Context, _: u64) void {}
-        }.f,
-        .getBoundsForSpace = struct {
-            fn f(_: *Context, _: u64) ?geometry.Rect {
-                return null;
-            }
-        }.f,
-    };
+    var ctx = makeTestContext(&wm, &sm, &dm, &cfg);
 
     const result = configSet(&ctx, "unknown_key", "value");
     try testing.expect(result == .err);
@@ -1959,23 +1815,7 @@ test "resolveSpace with label" {
 
     sm.setLabel(12345, "code") catch unreachable;
 
-    var ctx = Context{
-        .allocator = testing.allocator,
-        .skylight = undefined,
-        .connection = 0,
-        .windows = &wm,
-        .spaces = &sm,
-        .displays = &dm,
-        .config = &cfg,
-        .applyLayout = struct {
-            fn f(_: *Context, _: u64) void {}
-        }.f,
-        .getBoundsForSpace = struct {
-            fn f(_: *Context, _: u64) ?geometry.Rect {
-                return null;
-            }
-        }.f,
-    };
+    var ctx = makeTestContext(&wm, &sm, &dm, &cfg);
 
     const result = resolveSpace(&ctx, .{ .label = "code" });
     try testing.expectEqual(@as(?u64, 12345), result);
@@ -1990,23 +1830,7 @@ test "resolveSpace with id" {
     defer dm.deinit();
     var cfg = Config{};
 
-    var ctx = Context{
-        .allocator = testing.allocator,
-        .skylight = undefined,
-        .connection = 0,
-        .windows = &wm,
-        .spaces = &sm,
-        .displays = &dm,
-        .config = &cfg,
-        .applyLayout = struct {
-            fn f(_: *Context, _: u64) void {}
-        }.f,
-        .getBoundsForSpace = struct {
-            fn f(_: *Context, _: u64) ?geometry.Rect {
-                return null;
-            }
-        }.f,
-    };
+    var ctx = makeTestContext(&wm, &sm, &dm, &cfg);
 
     const result = resolveSpace(&ctx, .{ .id = 999 });
     try testing.expectEqual(@as(?u64, 999), result);

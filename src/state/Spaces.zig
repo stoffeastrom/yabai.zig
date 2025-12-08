@@ -333,10 +333,14 @@ pub fn applyLayout(self: *Spaces, sid: Space.Id, bounds: geometry.Rect, windows_
     const frames = try view.calculateFrames(windows, self.allocator);
     defer self.allocator.free(frames);
 
-    // Apply each frame to its window
+    // Apply each frame to its window using cached ax_ref (works cross-space)
     for (frames) |frame| {
-        Window.setFrameById(frame.window_id, frame.frame) catch |e| {
-            log.err("applyLayout: setFrameById failed for wid={}: {}", .{ frame.window_id, e });
+        const entry = windows_state.getWindow(frame.window_id) orelse {
+            log.err("applyLayout: window {} not found in WindowTable", .{frame.window_id});
+            continue;
+        };
+        Window.setFrameByRef(entry.ax_ref, frame.window_id, frame.frame) catch |e| {
+            log.err("applyLayout: setFrameByRef failed for wid={}: {}", .{ frame.window_id, e });
             continue;
         };
     }

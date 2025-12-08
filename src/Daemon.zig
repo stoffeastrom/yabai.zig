@@ -42,25 +42,47 @@ pub const SACapabilities = struct {
 };
 
 /// Dirty state flags - accumulated during event handling, processed once per loop tick
-pub const DirtyFlags = packed struct(u16) {
+pub const DirtyFlags = packed struct(u32) {
+    // Layout flags
     /// Need to apply layout to current space
     layout_current: bool = false,
     /// Need to apply layout to all visible spaces
     layout_all: bool = false,
+    /// Need to rebuild BSP tree (not just reapply)
+    rebuild_view: bool = false,
+
+    // Sync flags
     /// Need to rescan running applications
     scan_apps: bool = false,
     /// Need to sync space labels with config
     sync_spaces: bool = false,
-    /// Need to rebuild BSP tree (not just reapply)
-    rebuild_view: bool = false,
     /// Need to sync config to state
     sync_config: bool = false,
+
+    // Validation flags
+    /// Need to validate all state (remove stale, refresh from macOS)
+    validate_state: bool = false,
+    /// Need to refresh window-to-space mappings from macOS
+    refresh_window_spaces: bool = false,
+
+    // Pending app events (queued PIDs processed in batch)
+    /// One or more apps launched - need to track them
+    apps_launched: bool = false,
+    /// One or more apps terminated - need to clean up
+    apps_terminated: bool = false,
+    /// App front switched - need to update focus tracking
+    app_focus_changed: bool = false,
+    /// One or more apps hidden
+    apps_hidden: bool = false,
+    /// One or more apps shown
+    apps_shown: bool = false,
+
     /// Reserved for future use
-    _padding: u10 = 0,
+    _padding: u19 = 0,
 
     /// Check if any work is pending
     pub fn any(self: DirtyFlags) bool {
-        return @as(u16, @bitCast(self)) != 0;
+        return @as(u32, @bitCast(self)) != 0;
     }
 
     /// Clear all flags
@@ -104,6 +126,42 @@ pub const DirtySpaces = struct {
     /// Check if any spaces are dirty
     pub fn any(self: *const DirtySpaces) bool {
         return self.count > 0;
+    }
+};
+
+/// Queue for pending PID events - fixed size ring buffer
+pub const PidQueue = struct {
+    pids: [32]c.pid_t = [_]c.pid_t{0} ** 32,
+    count: u8 = 0,
+
+    /// Add a PID to the queue (deduplicates)
+    pub fn push(self: *PidQueue, pid: c.pid_t) void {
+        // Check if already queued
+        for (self.pids[0..self.count]) |p| {
+            if (p == pid) return;
+        }
+        // Add if room
+        if (self.count < self.pids.len) {
+            self.pids[self.count] = pid;
+            self.count += 1;
+        }
+    }
+
+    /// Get all queued PIDs and clear
+    pub fn drain(self: *PidQueue) []const c.pid_t {
+        const result = self.pids[0..self.count];
+        self.count = 0;
+        return result;
+    }
+
+    /// Check if any PIDs are queued
+    pub fn any(self: *const PidQueue) bool {
+        return self.count > 0;
+    }
+
+    /// Clear the queue
+    pub fn clear(self: *PidQueue) void {
+        self.count = 0;
     }
 };
 
@@ -160,10 +218,18 @@ pub const Daemon = struct {
     ffm_window_id: u32 = 0, // One-shot: window ID that FFM is currently focusing (cleared on focus confirm)
     last_ffm_time: i64 = 0, // Timestamp of last FFM focus attempt (nanoseconds)
     last_validation_time: i64 = 0, // Timestamp of last state validation
+    last_space_change_time: i64 = 0, // Timestamp of last space change (for debouncing layout)
 
     // Dirty state - accumulated during events, processed once per loop tick
     dirty: DirtyFlags = .{},
     dirty_spaces: DirtySpaces = .{},
+
+    // Pending PID queues - events queue PIDs, processDirtyState handles them
+    pending_launched: PidQueue = .{},
+    pending_terminated: PidQueue = .{},
+    pending_hidden: PidQueue = .{},
+    pending_shown: PidQueue = .{},
+    pending_focus_pid: c.pid_t = 0, // Most recent app that received focus
 
     // Display change debouncing - coalesce rapid-fire callbacks
     display_change_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -507,6 +573,10 @@ pub const Daemon = struct {
         const now: i64 = @truncate(std.time.nanoTimestamp());
         const elapsed_ms = @divFloor(now - self.last_ffm_time, std.time.ns_per_ms);
         if (elapsed_ms < 50) return event;
+
+        // Suppress FFM during space transitions (500ms after space change)
+        const space_elapsed_ms = @divFloor(now - self.last_space_change_time, std.time.ns_per_ms);
+        if (space_elapsed_ms < 500) return event;
 
         // Clear stale ffm_window_id after timeout (200ms) - focus confirmation may not arrive
         if (self.ffm_window_id != 0 and elapsed_ms > 200) {
@@ -910,8 +980,33 @@ pub const Daemon = struct {
             if (self.sa.can_focus_window) {
                 log.info("SA: window focus available", .{});
             }
+
+            // Send discovered addresses to SA payload
+            self.configureSAPayload();
         } else {
             log.info("SA: no functions discovered - advanced features unavailable", .{});
+        }
+    }
+
+    /// Send discovered function addresses to SA payload
+    fn configureSAPayload(self: *Self) void {
+        const sa = self.sa_client orelse return;
+        const discovery = self.sa.discovery orelse return;
+
+        const funcs = discovery.functions;
+        // Payload expects virtual address offset (address - 0x100000000)
+        const base: u64 = 0x100000000;
+        const dock_spaces = funcs[@intFromEnum(sa_patterns.FunctionType.dock_spaces)].address -| base;
+        const add_space = funcs[@intFromEnum(sa_patterns.FunctionType.add_space)].address -| base;
+        const remove_space = funcs[@intFromEnum(sa_patterns.FunctionType.remove_space)].address -| base;
+        const move_space = funcs[@intFromEnum(sa_patterns.FunctionType.move_space)].address -| base;
+
+        log.info("SA: sending configure: dock_spaces=0x{x} add=0x{x} remove=0x{x} move=0x{x}", .{ dock_spaces, add_space, remove_space, move_space });
+
+        if (sa.configure(dock_spaces, add_space, remove_space, move_space)) {
+            log.info("SA: configured payload with discovered addresses", .{});
+        } else {
+            log.warn("SA: failed to configure payload (not yet loaded?)", .{});
         }
     }
 
@@ -1014,6 +1109,7 @@ pub const Daemon = struct {
             .sa_client = if (self.sa_client) |*client| client else null,
             .applyLayout = applyLayoutCallback,
             .getBoundsForSpace = getBoundsCallback,
+            .markSpaceDirty = markSpaceDirtyCallback,
         };
 
         // Execute the command
@@ -1037,6 +1133,13 @@ pub const Daemon = struct {
         _ = ctx;
         const self = instance orelse return null;
         return self.getBoundsForSpace(space_id);
+    }
+
+    /// Callback for CommandHandler to mark a space dirty for layout
+    fn markSpaceDirtyCallback(ctx: *@import("ipc/CommandHandler.zig").Context, space_id: u64) void {
+        _ = ctx;
+        const self = instance orelse return;
+        self.dirty_spaces.mark(space_id);
     }
 
     fn handleQuery(self: *Self, client_fd: std.posix.socket_t, args: []const u8) void {
@@ -1419,6 +1522,7 @@ pub const Daemon = struct {
     }
 
     /// Process accumulated dirty state - called once per loop tick
+    /// Order matters: validate -> sync -> process events -> layout
     fn processDirtyState(self: *Self) void {
         // Check for debounced display change first (highest priority)
         if (self.display_change_pending.load(.acquire)) {
@@ -1431,9 +1535,8 @@ pub const Daemon = struct {
                 self.display_change_pending.store(false, .release);
                 log.info("display change: processing after {}ms settle", .{elapsed_ms});
                 self.handleDisplayChangeSettled();
-                // Display change does its own layout, skip other dirty processing
-                self.dirty.clear();
-                self.dirty_spaces.clear();
+                // Display change does full sync, clear everything
+                self.clearAllDirtyState();
                 return;
             }
         }
@@ -1444,59 +1547,152 @@ pub const Daemon = struct {
             const now = std.time.nanoTimestamp();
             const elapsed_ms = @divFloor(now - move_time, std.time.ns_per_ms);
 
-            // Try every 200ms, give up after 5 seconds
             if (elapsed_ms >= 200) {
                 if (elapsed_ms > 5000) {
                     log.warn("pending moves: giving up after {}ms", .{elapsed_ms});
                     self.pending_window_moves.store(false, .release);
                 } else if (self.sa_client) |sa| {
                     if (sa.isAvailable()) {
-                        log.info("pending moves: SA available after {}ms, moving windows", .{elapsed_ms});
+                        log.info("pending moves: SA available after {}ms", .{elapsed_ms});
                         self.pending_window_moves.store(false, .release);
                         const moves = self.moveWindowsToMatchLabels();
-                        if (moves > 0) {
-                            self.layoutVisibleSpaces();
-                        }
-                        log.info("pending moves: completed {} moves", .{moves});
+                        if (moves > 0) self.layoutVisibleSpaces();
                     } else {
-                        // Update time to retry in another 200ms
                         self.pending_moves_time.store(@truncate(now), .release);
-                        log.debug("pending moves: SA still unavailable, will retry", .{});
                     }
                 }
             }
         }
 
-        // Skip if nothing else to do
+        // Skip if nothing to do
         if (!self.dirty.any() and !self.dirty_spaces.any()) return;
 
         const span = trace.begin("process_dirty", .event);
         defer span.end();
 
-        // Process in priority order
+        // Track if we need layout at the end
+        var needs_layout_current = self.dirty.layout_current;
+        const needs_layout_all = self.dirty.layout_all;
 
-        // 1. Rescan apps (may add windows that need layout)
+        // =====================================================================
+        // Phase 1: State validation (detect stale, remove invalid)
+        // =====================================================================
+
+        if (self.dirty.validate_state) {
+            const s = trace.begin("validate_state", .event);
+            defer s.end();
+            self.validateState();
+        }
+
+        // =====================================================================
+        // Phase 2: Process terminated apps (cleanup before adding new)
+        // =====================================================================
+
+        if (self.dirty.apps_terminated) {
+            const pids = self.pending_terminated.drain();
+            for (pids) |pid| {
+                const removed = self.windows.removeWindowsForPid(pid);
+                if (removed > 0) {
+                    log.debug("app terminated: removed {d} windows for pid={d}", .{ removed, pid });
+                    needs_layout_current = true;
+                }
+                self.removeApplicationWithPid(pid);
+            }
+        }
+
+        // =====================================================================
+        // Phase 3: Sync from macOS (refresh truth)
+        // =====================================================================
+
+        if (self.dirty.refresh_window_spaces) {
+            const s = trace.begin("refresh_window_spaces", .event);
+            defer s.end();
+            _ = self.refreshWindowSpaceIds();
+        }
+
         if (self.dirty.scan_apps) {
             const s = trace.begin("scan_apps", .event);
             defer s.end();
             self.scanRunningApplications();
         }
 
-        // 2. Sync spaces (may affect which spaces exist)
         if (self.dirty.sync_spaces) {
             const s = trace.begin("sync_spaces", .space);
             defer s.end();
             self.syncSpaces();
         }
 
-        // 3. Sync config to state
         if (self.dirty.sync_config) {
             const s = trace.begin("sync_config", .config);
             defer s.end();
             self.syncConfigToState();
         }
 
-        // 4. Rebuild views (before layout)
+        // =====================================================================
+        // Phase 4: Process launched apps (after sync, may need layout)
+        // =====================================================================
+
+        if (self.dirty.apps_launched) {
+            const pids = self.pending_launched.drain();
+            for (pids) |pid| {
+                self.addApplicationWithPid(pid);
+            }
+            if (pids.len > 0) needs_layout_current = true;
+        }
+
+        // =====================================================================
+        // Phase 5: Process hidden/shown apps
+        // =====================================================================
+
+        if (self.dirty.apps_hidden) {
+            const pids = self.pending_hidden.drain();
+            for (pids) |pid| {
+                const windows = self.windows.getWindowsForPid(pid);
+                for (windows) |wid| {
+                    self.windows.setHidden(wid, true);
+                }
+            }
+            if (pids.len > 0) needs_layout_current = true;
+        }
+
+        if (self.dirty.apps_shown) {
+            const pids = self.pending_shown.drain();
+            for (pids) |pid| {
+                const windows = self.windows.getWindowsForPid(pid);
+                for (windows) |wid| {
+                    self.windows.setHidden(wid, false);
+                }
+            }
+            if (pids.len > 0) needs_layout_current = true;
+        }
+
+        // =====================================================================
+        // Phase 6: Process focus changes (track new windows)
+        // =====================================================================
+
+        if (self.dirty.app_focus_changed and self.pending_focus_pid != 0) {
+            const pid = self.pending_focus_pid;
+            self.pending_focus_pid = 0;
+
+            // Try to track the focused window for this app
+            if (self.apps.getApplication(pid)) |app| {
+                if (Application.getFocusedWindow(app.ax_ref)) |win_ref| {
+                    defer c.c.CFRelease(win_ref);
+                    if (Application.getWindowId(win_ref)) |wid| {
+                        if (self.windows.getWindow(wid) == null) {
+                            self.trackNewWindow(pid, wid, win_ref);
+                            needs_layout_current = true;
+                        }
+                        self.windows.setFocused(wid);
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Phase 7: Rebuild views if needed
+        // =====================================================================
+
         if (self.dirty.rebuild_view) {
             const s = trace.begin("rebuild_view", .layout);
             defer s.end();
@@ -1505,58 +1701,54 @@ pub const Daemon = struct {
             }
         }
 
-        // 5. Layout - either all spaces or specific dirty ones
-        if (self.dirty.layout_all) {
+        // =====================================================================
+        // Phase 8: Apply layouts
+        // =====================================================================
+
+        if (needs_layout_all) {
             const s = trace.begin("layout_all", .layout);
             defer s.end();
             self.applyAllSpaceLayouts();
-        } else if (self.dirty.layout_current) {
+        } else if (needs_layout_current) {
             const s = trace.begin("layout_current", .layout);
             defer s.end();
             self.applyCurrentLayout();
         } else if (self.dirty_spaces.any()) {
-            // Layout only specific dirty spaces (but only if visible)
             for (self.dirty_spaces.spaces[0..self.dirty_spaces.count]) |sid| {
                 if (Space.isVisible(sid)) {
                     self.applyLayoutToSpace(sid);
-                } else {
-                    log.debug("skipping layout for non-visible space {}", .{sid});
                 }
             }
         }
 
         // Clear all dirty state
+        self.clearAllDirtyState();
+    }
+
+    /// Clear all dirty flags and queues
+    fn clearAllDirtyState(self: *Self) void {
         self.dirty.clear();
         self.dirty_spaces.clear();
+        self.pending_launched.clear();
+        self.pending_terminated.clear();
+        self.pending_hidden.clear();
+        self.pending_shown.clear();
+        self.pending_focus_pid = 0;
     }
 
-    /// Stop the run loop
-    pub fn stop(self: *Self) void {
-        self.running.store(false, .release);
-        runloop.stop(runloop.getMain());
-    }
-
-    /// Periodic state validation - cleans up stale state and checks health
-    fn periodicStateValidation(self: *Self) void {
-        const now: i64 = @truncate(std.time.nanoTimestamp());
-        const elapsed_ms = @divFloor(now - self.last_validation_time, std.time.ns_per_ms);
-
-        // Run validation every 5 seconds
-        if (elapsed_ms < 5000) return;
-        self.last_validation_time = now;
-
+    /// Validate all tracked state - remove stale entries
+    fn validateState(self: *Self) void {
         var cleaned_windows: u32 = 0;
+        var cleaned_apps: u32 = 0;
 
-        // Validate all tracked windows still exist (use fixed buffer, run multiple passes if needed)
+        // Validate windows still exist
         var windows_to_remove: [64]Window.Id = undefined;
         var remove_count: usize = 0;
 
         var win_it = self.windows.iterator();
         while (win_it.next()) |entry| {
             const wid = entry.key_ptr.*;
-            const space = Window.getSpace(wid);
-            if (space == 0) {
-                // Window no longer exists
+            if (Window.getSpace(wid) == 0) {
                 if (remove_count < windows_to_remove.len) {
                     windows_to_remove[remove_count] = wid;
                     remove_count += 1;
@@ -1564,7 +1756,6 @@ pub const Daemon = struct {
             }
         }
 
-        // Remove stale windows
         for (windows_to_remove[0..remove_count]) |wid| {
             _ = self.windows.removeWindow(wid);
             cleaned_windows += 1;
@@ -1574,9 +1765,54 @@ pub const Daemon = struct {
         if (self.windows.getFocusedId()) |focused_wid| {
             if (Window.getSpace(focused_wid) == 0) {
                 self.windows.setFocused(null);
-                log.debug("validation: cleared stale focused_window_id={d}", .{focused_wid});
             }
         }
+
+        // Validate apps still running (check if PID exists)
+        const all_pids = self.apps.getAllPids(self.allocator) catch return;
+        defer self.allocator.free(all_pids);
+
+        var apps_to_remove: [32]c.pid_t = undefined;
+        var app_remove_count: usize = 0;
+
+        for (all_pids) |pid| {
+            // Check if process still exists
+            if (c.c.kill(pid, 0) != 0 and std.c._errno().* == @intFromEnum(std.c.E.SRCH)) {
+                if (app_remove_count < apps_to_remove.len) {
+                    apps_to_remove[app_remove_count] = pid;
+                    app_remove_count += 1;
+                }
+            }
+        }
+
+        for (apps_to_remove[0..app_remove_count]) |pid| {
+            _ = self.windows.removeWindowsForPid(pid);
+            self.removeApplicationWithPid(pid);
+            cleaned_apps += 1;
+        }
+
+        if (cleaned_windows > 0 or cleaned_apps > 0) {
+            log.info("validateState: cleaned {d} windows, {d} apps", .{ cleaned_windows, cleaned_apps });
+        }
+    }
+
+    /// Stop the run loop
+    pub fn stop(self: *Self) void {
+        self.running.store(false, .release);
+        runloop.stop(runloop.getMain());
+    }
+
+    /// Periodic state validation - runs every 5 seconds
+    fn periodicStateValidation(self: *Self) void {
+        const now: i64 = @truncate(std.time.nanoTimestamp());
+        const elapsed_ms = @divFloor(now - self.last_validation_time, std.time.ns_per_ms);
+
+        // Run validation every 5 seconds
+        if (elapsed_ms < 5000) return;
+        self.last_validation_time = now;
+
+        // Validate state (remove stale windows/apps)
+        self.validateState();
 
         // Re-enable event tap if it got disabled
         if (self.config.focus_follows_mouse != .disabled) {
@@ -1586,14 +1822,9 @@ pub const Daemon = struct {
                     c.c.CGEventTapEnable(tap, true);
                 }
             } else {
-                // Event tap is null but FFM is enabled - try to recreate
                 log.warn("validation: event tap is null, attempting to recreate", .{});
                 self.startMouseEventTap();
             }
-        }
-
-        if (cleaned_windows > 0) {
-            log.info("validation: cleaned {d} stale windows", .{cleaned_windows});
         }
 
         // Debug memory stats
@@ -1967,7 +2198,7 @@ pub const Daemon = struct {
                 log.info("sync: creating {} spaces on {s} (have={}, want={}, last_space={})", .{ to_create, label, have, want, if (have > 0) user_spaces[have - 1] else 0 });
                 const last_space = if (have > 0) user_spaces[have - 1] else continue;
                 for (0..to_create) |_| {
-                    if (sa.createSpace(last_space)) {
+                    if (sa.createSpace(last_space) != null) {
                         result.created += 1;
                     } else break;
                     std.Thread.sleep(100 * std.time.ns_per_ms);
@@ -2478,7 +2709,7 @@ pub const Daemon = struct {
             const to_create = wanted - user_count;
             const last_space = user_spaces[user_count - 1];
             for (0..to_create) |_| {
-                if (sa.createSpace(last_space)) {
+                if (sa.createSpace(last_space) != null) {
                     user_count += 1;
                     // Small delay to let macOS process the space creation
                     std.Thread.sleep(100 * std.time.ns_per_ms);
@@ -3076,54 +3307,82 @@ pub const Daemon = struct {
     }
 
     /// Handle application front switched (Cmd+Tab, click on app, etc.)
+    /// Note: This does some immediate work (focus tracking, mouse warp) because
+    /// these are time-sensitive user interactions. Heavy work (tracking new windows)
+    /// is deferred via dirty flags.
     fn handleApplicationFrontSwitched(self: *Self, pid: c.pid_t) void {
         // Get the app's focused window
-        if (self.apps.getApplication(pid)) |app| {
-            if (Application.getFocusedWindow(app.ax_ref)) |win_ref| {
-                defer c.c.CFRelease(win_ref);
-                if (Application.getWindowId(win_ref)) |wid| {
-                    // Check if this window is tracked
-                    if (self.windows.getWindow(wid) == null) {
-                        // Untracked window - try to track it now
-                        self.trackNewWindow(pid, wid, win_ref);
-                    }
+        const app = self.apps.getApplication(pid) orelse {
+            log.debug("app front switched: pid={d} (not tracked)", .{pid});
+            return;
+        };
 
-                    // Update tracking
-                    self.windows.setFocused(wid);
+        const win_ref = Application.getFocusedWindow(app.ax_ref) orelse {
+            log.debug("app front switched: pid={d} (no focused window)", .{pid});
+            return;
+        };
+        defer c.c.CFRelease(win_ref);
 
-                    // Check if FFM caused this switch
-                    const was_ffm = (self.ffm_window_id == wid);
-                    self.ffm_window_id = 0; // Clear one-shot flag
+        const wid = Application.getWindowId(win_ref) orelse {
+            log.debug("app front switched: pid={d} (no window id)", .{pid});
+            return;
+        };
 
-                    if (was_ffm) {
-                        log.debug("app front switched: pid={d} wid={d} (ffm confirmed)", .{ pid, wid });
-                        return;
-                    }
-
-                    // Non-FFM switch - warp mouse if enabled
-                    if (self.config.mouse_follows_focus) {
-                        log.debug("app front switched: pid={d} focused wid={d}", .{ pid, wid });
-                        self.warpMouseToWindow(wid);
-                    }
-                    return;
-                }
-            }
+        // Check if this window is tracked
+        if (self.windows.getWindow(wid) == null) {
+            // Queue for tracking - will be handled in processDirtyState
+            self.pending_focus_pid = pid;
+            self.dirty.app_focus_changed = true;
+            return;
         }
-        log.debug("app front switched: pid={d} (not tracked or no window)", .{pid});
+
+        // Update focus tracking (immediate - affects FFM logic)
+        self.windows.setFocused(wid);
+
+        // Check if FFM caused this switch
+        const was_ffm = (self.ffm_window_id == wid);
+        self.ffm_window_id = 0; // Clear one-shot flag
+
+        if (was_ffm) {
+            log.debug("app front switched: pid={d} wid={d} (ffm confirmed)", .{ pid, wid });
+            return;
+        }
+
+        // Non-FFM switch - warp mouse if enabled (immediate response)
+        if (self.config.mouse_follows_focus) {
+            log.debug("app front switched: pid={d} focused wid={d}", .{ pid, wid });
+            self.warpMouseToWindow(wid);
+        }
     }
 
     /// Track a newly discovered window (missed during initial scan)
     fn trackNewWindow(self: *Self, pid: c.pid_t, wid: Window.Id, win_ref: c.AXUIElementRef) void {
+        // Skip if already tracked - this can happen if window was explicitly moved by command
+        // before we discovered it via notifications
+        if (self.windows.getWindow(wid) != null) {
+            log.debug("trackNewWindow: wid={} already tracked, skipping", .{wid});
+            return;
+        }
+
         // Get app name for rule matching
         var app_name_buf: [256]u8 = undefined;
         const name_len = c.c.proc_name(pid, &app_name_buf, 256);
         const app_name: ?[]const u8 = if (name_len > 0) app_name_buf[0..@intCast(name_len)] else null;
 
-        // Get window's current space
+        // Get window's current space - prefer current space since we can see it via AX
+        // SkyLight APIs can return stale data during space transitions
+        const current_space = self.getCurrentSpaceId() orelse return;
         var space_id = Window.getSpace(wid);
-        if (space_id == 0) space_id = self.getCurrentSpaceId() orelse return;
+        if (space_id == 0 or space_id != current_space) {
+            // If SkyLight disagrees or returns 0, trust current space since we can see window via AX
+            space_id = current_space;
+        }
 
-        // Check if managed
+        // Check if managed and apply non-space rules
+        // Note: We don't apply space rules for late-discovered windows because:
+        // 1. The window may have been explicitly moved by user command
+        // 2. Late discovery usually means we're switching to a space where the window already exists
+        // 3. Moving windows during discovery causes layout chaos
         var should_manage = self.shouldManageWindow(win_ref);
         if (app_name) |name| {
             const rules = self.config.findMatchingRules(name, null, self.allocator) catch &[_]*const Config.AppRule{};
@@ -3134,20 +3393,8 @@ pub const Daemon = struct {
                     should_manage = manage;
                 }
 
-                // Apply space rule
-                if (rule.space) |space_name| {
-                    if (self.resolveSpaceName(space_name)) |target_space| {
-                        if (target_space != space_id) {
-                            if (self.moveWindowToSpaceInternal(wid, target_space)) {
-                                log.info("rule: moved late {s} window {} to space {s}", .{ name, wid, space_name });
-                                self.windows.setWindowSpace(wid, target_space);
-                                self.dirty_spaces.mark(space_id);
-                                self.dirty_spaces.mark(target_space);
-                                space_id = target_space;
-                            }
-                        }
-                    }
-                }
+                // Skip space rules for late-discovered windows - track where they are
+                // Space rules are only applied during initial app launch
 
                 if (rule.opacity) |opacity| {
                     Window.setOpacity(wid, opacity) catch {};
@@ -3185,77 +3432,60 @@ pub const Daemon = struct {
         self.dirty_spaces.mark(space_id);
     }
 
-    /// Handle application launched event
+    /// Handle application launched event - queue PID for processing
     pub fn handleApplicationLaunched(self: *Self, pid: c.pid_t) void {
-        self.addApplicationWithPid(pid);
-        self.dirty.layout_current = true;
+        self.pending_launched.push(pid);
+        self.dirty.apps_launched = true;
     }
 
-    /// Handle application terminated event
+    /// Handle application terminated event - queue PID for cleanup
     pub fn handleApplicationTerminated(self: *Self, pid: c.pid_t) void {
-        // Remove all windows for this PID from Windows
-        const removed = self.windows.removeWindowsForPid(pid);
-        if (removed > 0) {
-            log.debug("app terminated: removed {d} windows for pid={d}", .{ removed, pid });
-        }
-
-        // Remove app from tracking
-        self.removeApplicationWithPid(pid);
-
-        // Mark layout as dirty
-        self.dirty.layout_current = true;
+        self.pending_terminated.push(pid);
+        self.dirty.apps_terminated = true;
     }
 
-    /// Handle application hidden event - mark windows as hidden for layout exclusion
+    /// Handle application hidden event - queue PID
     fn handleApplicationHidden(self: *Self, pid: c.pid_t) void {
-        // Mark all windows for this PID as hidden
-        const windows = self.windows.getWindowsForPid(pid);
-        for (windows) |wid| {
-            self.windows.setHidden(wid, true);
-        }
-        self.dirty.layout_current = true;
+        self.pending_hidden.push(pid);
+        self.dirty.apps_hidden = true;
     }
 
-    /// Handle application visible event - mark windows as visible and re-layout
+    /// Handle application visible event - queue PID
     fn handleApplicationVisible(self: *Self, pid: c.pid_t) void {
-        // Mark all windows for this PID as visible
-        const windows = self.windows.getWindowsForPid(pid);
-        for (windows) |wid| {
-            self.windows.setHidden(wid, false);
-        }
-        self.dirty.layout_current = true;
+        self.pending_shown.push(pid);
+        self.dirty.apps_shown = true;
     }
 
-    /// Handle space changed event - switch to new space's layout
+    /// Handle space changed event - just update tracking and mark dirty
     fn handleSpaceChanged(self: *Self) void {
+        // Query current space and update tracking
         const new_sid = self.getCurrentSpaceId() orelse return;
         const old_sid = self.spaces.current_space_id;
 
-        // Update current space tracking
         self.spaces.setCurrentSpace(new_sid);
+        self.last_space_change_time = @truncate(std.time.nanoTimestamp());
 
-        // Skip layout if returning to same space (no windows changed)
-        if (old_sid == new_sid) {
-            log.debug("space changed: same space {}, skipping layout", .{new_sid});
-            return;
+        if (old_sid != new_sid) {
+            // Layout current space - don't refresh window spaces here,
+            // that causes chaos during space transitions. Window tracking
+            // is updated when windows are explicitly moved.
+            self.dirty.layout_current = true;
         }
-
-        // Mark current space as needing layout
-        self.dirty.layout_current = true;
     }
 
     /// Handle active display changed event (focus moved between displays)
     /// Note: This is NOT for display add/remove - that's handled by displayReconfigurationCallback
     fn handleDisplayChanged(self: *Self) void {
         // No-op: active display change doesn't need relayout
-        // Display reconfiguration (add/remove) is handled separately
         _ = self;
     }
 
-    /// Handle system wake event - rescan and rebuild everything
+    /// Handle system wake event - full state refresh
     fn handleSystemWoke(self: *Self) void {
-        // After wake, windows may have moved or apps may have changed state
+        // After wake, everything may have changed
+        self.dirty.validate_state = true;
         self.dirty.scan_apps = true;
+        self.dirty.refresh_window_spaces = true;
         self.dirty.layout_all = true;
     }
 };

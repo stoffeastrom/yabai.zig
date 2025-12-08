@@ -121,7 +121,9 @@ fn printUsage() void {
         \\    --stop-service         Stops a running instance of the service.
         \\    --load-sa              Install and load scripting addition (requires sudo).
         \\    --unload-sa            Unload and remove scripting addition (requires sudo).
-        \\    --install-sudoers      Add sudoers entry for passwordless --load-sa.
+        \\    --reload-sa            Kill Dock and re-inject SA (requires sudo, for development).
+        \\    --kill-dock            Kill Dock to reload scripting addition.
+        \\    --install-sudoers      Add sudoers entry for passwordless SA operations.
         \\    --message, -m <msg>    Send message to a running instance of yabai.zig.
         \\    --config, -c <config>  Use the specified configuration file.
         \\    --timeout <ms>         Exit after specified milliseconds (for testing).
@@ -261,6 +263,16 @@ pub fn main() !u8 {
         return sendMessage(allocator, args[2..]);
     }
 
+    // Direct domain commands: space, window, display, query, config
+    if (std.mem.eql(u8, opt, "space") or
+        std.mem.eql(u8, opt, "window") or
+        std.mem.eql(u8, opt, "display") or
+        std.mem.eql(u8, opt, "query") or
+        std.mem.eql(u8, opt, "config"))
+    {
+        return sendMessage(allocator, args[1..]);
+    }
+
     // Service operations
     if (std.mem.eql(u8, opt, "--install-service")) {
         return installService();
@@ -299,10 +311,18 @@ pub fn main() !u8 {
     if (std.mem.eql(u8, opt, "--unload-sa")) {
         return unloadSA();
     }
+    if (std.mem.eql(u8, opt, "--reload-sa")) {
+        return reloadSA();
+    }
 
     // Sudoers setup for passwordless SA loading
     if (std.mem.eql(u8, opt, "--install-sudoers")) {
         return installSudoers();
+    }
+
+    // Kill Dock (convenience for SA reload during development)
+    if (std.mem.eql(u8, opt, "--kill-dock")) {
+        return killDock();
     }
 
     // Parse remaining options for daemon mode
@@ -928,6 +948,54 @@ fn unloadSA() u8 {
     return 0;
 }
 
+fn killDock() u8 {
+    const stdout = getStdout();
+    stdout.writeAll("yabai.zig: killing Dock...\n") catch {};
+    return runCmd(&.{ "/usr/bin/killall", "Dock" }, false);
+}
+
+fn reloadSA() u8 {
+    const stdout = getStdout();
+    const stderr = getStderr();
+
+    // Check if running as root
+    if (std.c.getuid() != 0) {
+        stderr.writeAll("yabai.zig: --reload-sa must be run as root!\n") catch {};
+        stderr.writeAll("Run: sudo yabai.zig --reload-sa\n") catch {};
+        return 1;
+    }
+
+    // Install SA files first
+    if (!installSAFiles()) {
+        stderr.writeAll("yabai.zig: failed to install scripting-addition files\n") catch {};
+        return 1;
+    }
+
+    // Kill Dock
+    stdout.writeAll("yabai.zig: killing Dock...\n") catch {};
+    _ = runCmd(&.{ "/usr/bin/killall", "Dock" }, true);
+
+    // Wait for Dock to restart
+    stdout.writeAll("yabai.zig: waiting for Dock to restart...\n") catch {};
+    var dock_pid: i32 = 0;
+    for (0..50) |_| { // 5 seconds max
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+        dock_pid = workspace.getDockPid();
+        if (dock_pid != 0) break;
+    }
+
+    if (dock_pid == 0) {
+        stderr.writeAll("yabai.zig: Dock did not restart\n") catch {};
+        return 1;
+    }
+
+    // Wait for Dock to fully initialize before injection
+    std.Thread.sleep(500 * std.time.ns_per_ms);
+
+    // Now inject
+    return loadSA();
+}
+
 fn installSudoers() u8 {
     const stdout = getStdout();
     const stderr = getStderr();
@@ -943,16 +1011,14 @@ fn installSudoers() u8 {
         return 1;
     };
 
-    // Create sudoers entry: user ALL=(root) NOPASSWD: sha256:HASH /path/to/yabai.zig --load-sa
-    // Using sha256 hash ensures only this exact binary can run without password
-    var hash_buf: [128]u8 = undefined;
-    const hash = getSha256Hash(exe_path, &hash_buf) orelse {
-        stderr.writeAll("yabai.zig: failed to compute binary hash\n") catch {};
-        return 1;
-    };
-
-    var entry_buf: [1024]u8 = undefined;
-    const entry = std.fmt.bufPrint(&entry_buf, "{s} ALL=(root) NOPASSWD: sha256:{s} {s} --load-sa\n", .{ user, hash, exe_path }) catch {
+    // Create sudoers entries for --load-sa and --reload-sa
+    // Restricted to specific arguments only (no hash - allows rebuilds)
+    var entry_buf: [2048]u8 = undefined;
+    const entry = std.fmt.bufPrint(&entry_buf,
+        \\{s} ALL=(root) NOPASSWD: {s} --load-sa
+        \\{s} ALL=(root) NOPASSWD: {s} --reload-sa
+        \\
+    , .{ user, exe_path, user, exe_path }) catch {
         stderr.writeAll("yabai.zig: path too long\n") catch {};
         return 1;
     };
@@ -1059,23 +1125,10 @@ fn checkSIPStatus() bool {
     return false;
 }
 
+// Embedded SA payload dylib (compiled from payload.m at build time)
+const sa_payload_bytes = @embedFile("sa_payload");
+
 fn installSAFiles() bool {
-    // Build path to payload dylib (relative to executable)
-    var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_path = std.fs.selfExePath(&exe_path_buf) catch return false;
-    const exe_dir = std.fs.path.dirname(exe_path) orelse return false;
-
-    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const src_path = std.fmt.bufPrint(&src_path_buf, "{s}/../lib/libyabai.zig-sa.dylib", .{exe_dir}) catch return false;
-
-    // Check source exists
-    std.fs.accessAbsolute(src_path, .{}) catch {
-        var err_buf: [512]u8 = undefined;
-        const err_msg = std.fmt.bufPrint(&err_buf, "yabai.zig: payload not found at {s}\n", .{src_path}) catch "yabai.zig: payload not found\n";
-        getStderr().writeAll(err_msg) catch {};
-        return false;
-    };
-
     // Create directory structure
     std.fs.makeDirAbsolute(SA_OSAX_PATH) catch |err| {
         if (err != error.PathAlreadyExists) {
@@ -1094,17 +1147,23 @@ fn installSAFiles() bool {
         if (err != error.PathAlreadyExists) return false;
     };
 
-    // Copy payload
-    std.fs.copyFileAbsolute(src_path, SA_PAYLOAD_PATH, .{}) catch |err| {
+    // Write embedded payload to disk
+    const file = std.fs.createFileAbsolute(SA_PAYLOAD_PATH, .{}) catch |err| {
         var err_buf: [256]u8 = undefined;
-        const err_msg = std.fmt.bufPrint(&err_buf, "yabai.zig: failed to copy payload: {}\n", .{err}) catch "yabai.zig: failed to copy payload\n";
+        const err_msg = std.fmt.bufPrint(&err_buf, "yabai.zig: failed to create payload: {}\n", .{err}) catch "yabai.zig: failed to create payload\n";
+        getStderr().writeAll(err_msg) catch {};
+        return false;
+    };
+    defer file.close();
+
+    file.writeAll(sa_payload_bytes) catch |err| {
+        var err_buf: [256]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&err_buf, "yabai.zig: failed to write payload: {}\n", .{err}) catch "yabai.zig: failed to write payload\n";
         getStderr().writeAll(err_msg) catch {};
         return false;
     };
 
     // Make executable
-    const file = std.fs.openFileAbsolute(SA_PAYLOAD_PATH, .{ .mode = .read_write }) catch return false;
-    defer file.close();
     file.chmod(0o755) catch return false;
 
     var msg_buf: [256]u8 = undefined;
@@ -1136,24 +1195,7 @@ fn initSA() void {
         return;
     };
 
-    // Check if payload exists (either installed or in dev location)
-    const payload_exists = blk: {
-        std.fs.accessAbsolute(SA_PAYLOAD_PATH, .{}) catch {
-            // Check dev location
-            const exe_dir = std.fs.path.dirname(exe_path) orelse break :blk false;
-            var dev_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const dev_path = std.fmt.bufPrint(&dev_path_buf, "{s}/../lib/libyabai.zig-sa.dylib", .{exe_dir}) catch break :blk false;
-            std.fs.accessAbsolute(dev_path, .{}) catch break :blk false;
-            break :blk true;
-        };
-        break :blk true;
-    };
-
-    if (!payload_exists) {
-        log.info("SA: payload not found, space management disabled", .{});
-        return;
-    }
-
+    // Payload is embedded, so it's always available
     log.info("SA: not loaded, requesting authorization...", .{});
 
     // Use osascript to run with admin privileges (shows GUI prompt)

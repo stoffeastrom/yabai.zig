@@ -20,14 +20,28 @@ pub fn main() !u8 {
         return 1;
     };
 
-    // Check if SA is loaded
     const user = std.posix.getenv("USER") orelse "unknown";
-    var socket_path_buf: [128]u8 = undefined;
-    const socket_path = std.fmt.bufPrint(&socket_path_buf, "/tmp/yabai.zig-sa_{s}.socket", .{user}) catch "/tmp/yabai.zig-sa.socket";
 
-    const sa_loaded = if (std.fs.accessAbsolute(socket_path, .{})) true else |_| false;
+    // Check for --load-sa flag
+    var load_sa = false;
+    var args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
 
-    if (!sa_loaded) {
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--load-sa")) {
+            load_sa = true;
+            break;
+        }
+    }
+
+    if (load_sa) {
+        std.debug.print("Restarting Dock and loading SA...\n", .{});
+
+        var killall = std.process.Child.init(&.{ "/usr/bin/killall", "Dock" }, allocator);
+        killall.spawn() catch {};
+        _ = killall.wait() catch {};
+        std.Thread.sleep(2 * std.time.ns_per_s);
+
         std.debug.print("Loading SA...\n", .{});
 
         // Try passwordless sudo first (if user set up sudoers)
@@ -88,17 +102,16 @@ pub fn main() !u8 {
     };
     posix.sigaction(posix.SIG.INT, &act, null);
 
-    // Collect args to pass through
+    // Collect args to pass through (excluding --load-sa)
     var args_list = std.ArrayListUnmanaged([]const u8){};
     defer args_list.deinit(allocator);
 
     try args_list.append(allocator, yabai_path);
 
-    var args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
     for (args[1..]) |arg| {
-        try args_list.append(allocator, arg);
+        if (!std.mem.eql(u8, arg, "--load-sa")) {
+            try args_list.append(allocator, arg);
+        }
     }
 
     // Run yabai.zig

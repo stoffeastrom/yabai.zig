@@ -1,73 +1,128 @@
 # yabai.zig
 
-A hobby project porting [yabai](https://github.com/koekeishiya/yabai) to Zig.
+A Zig port of [yabai](https://github.com/koekeishiya/yabai) - a tiling window manager for macOS.
 
-This is a fun experiment to learn Zig while reimplementing a tiling window manager for macOS. It is **not** intended as a replacement for yabai - if you want a production-ready tiling window manager, use the original.
+This is a hobby project to learn Zig while reimplementing yabai. It is **not** intended as a replacement - use the original for production.
 
 ## Status
 
-Work in progress. Many features are missing or incomplete.
+Work in progress. Core features work:
+- BSP tiling layout
+- Space management (create, destroy, focus, move windows)
+- Focus-follows-mouse
+- Window rules
+- Config hot-reloading
 
 ## Key Differences from yabai
 
-**Runtime SA extraction**: Instead of shipping pre-compiled Scripting Addition bundles for each macOS version, yabai.zig attempts to discover SkyLight private API addresses at runtime by pattern-matching against the running Dock process. This means:
-- No need to update SA bundles for each macOS release
-- May break on major macOS changes (patterns need updating)
-- Experimental approach - less battle-tested than yabai's method
+**Runtime SA extraction**: Instead of shipping pre-compiled Scripting Addition bundles, yabai.zig discovers SkyLight private API addresses at runtime by pattern-matching the Dock binary. No SA updates needed for new macOS versions (unless patterns change).
 
-**Zig port**: The initial conversion was bootstrapped using `zig translate-c` to convert the C codebase, then iteratively rewritten to idiomatic Zig with the help of Claude.
+**Declarative config**: Uses a simple key=value config format instead of shell scripts.
 
-## Credits
+## Requirements
 
-This project is heavily inspired by and based on [yabai](https://github.com/koekeishiya/yabai) by [@koekeishiya](https://github.com/koekeishiya). The original yabai is an excellent tiling window manager for macOS, and this port would not exist without that work.
+- macOS 14.0+ (Sonoma)
+- Zig 0.14.0+
+- SIP debugging disabled: `csrutil enable --without debug` (from recovery mode)
 
-Also inspired by [skhd.zig](https://github.com/jackielii/skhd.zig) - a Zig port of skhd.
-
-Key techniques and approaches borrowed from yabai:
-- Scripting Addition (SA) injection for space management
-- SkyLight private framework usage
-- Window management via Accessibility APIs
-- BSP layout algorithm
-
-## Building
-
-Requires Zig 0.15.2+ and macOS.
+## Quick Start
 
 ```bash
+# Build
 zig build
+
+# Install service
+./zig-out/bin/yabai.zig --install-service
+
+# Load scripting addition (requires sudo)
+sudo ./zig-out/bin/yabai.zig --load-sa
+
+# Start service
+./zig-out/bin/yabai.zig --start-service
 ```
 
-## Running
+## Commands
 
 ```bash
-# Install certificate (first time only)
-zig build run -- --install-cert
+# Service management
+--install-service    Install launchd service
+--uninstall-service  Remove launchd service
+--start-service      Start the service
+--stop-service       Stop the service
+--restart-service    Restart the service
 
-# Sign the binary (required for accessibility permissions)
-zig build sign
+# Scripting Addition
+--load-sa            Inject SA into Dock (requires sudo)
+--unload-sa          Remove SA from Dock (requires sudo)
+--reload-sa          Kill Dock and re-inject SA
+--install-sudoers    Allow passwordless sudo for --load-sa
 
-# Run
-zig build run-signed
+# Other
+--check-sa           Verify SA pattern matching works
+-m <domain> <cmd>    Send message to running instance
+```
 
-# Or install as service
-zig build run -- --install-service
-zig build run -- --start-service
+## Configuration
+
+Config file: `~/.config/yabai.zig/config`
+
+```bash
+# Layout
+layout = bsp
+window_gap = 8
+top_padding = 8
+bottom_padding = 8
+left_padding = 8
+right_padding = 8
+
+# Behavior
+focus_follows_mouse = autofocus
+auto_balance = on
+
+# Rules (app:title patterns)
+rule = Finder:* manage=off
+rule = System Settings:* manage=off
+```
+
+## IPC
+
+```bash
+# Space commands
+./zig-out/bin/yabai.zig -m space --create
+./zig-out/bin/yabai.zig -m space --create --take  # Create and move focused window
+./zig-out/bin/yabai.zig -m space --destroy
+./zig-out/bin/yabai.zig -m space --focus next
+
+# Window commands
+./zig-out/bin/yabai.zig -m window --focus next
+./zig-out/bin/yabai.zig -m window --swap next
+./zig-out/bin/yabai.zig -m window --space 3
+
+# Query
+./zig-out/bin/yabai.zig -m query --windows
+./zig-out/bin/yabai.zig -m query --spaces
 ```
 
 ## Development
 
 ```bash
-# Build and run (stops yabai, runs yabai.zig, restarts yabai on exit)
-zig build dev
+zig build              # Build
+zig build test         # Run tests
+zig build dev          # Build and run with dev script
 
-# Run tests
-zig build test
+# After changes
+zig build && ./zig-out/bin/yabai.zig --restart-service
 
-# Analyze SA patterns in Dock (or any binary)
-zig build run -- --check-sa
-zig build run -- --check-sa /path/to/binary
+# Logs
+tail -f /tmp/yabai.zig.log
 ```
+
+## Credits
+
+Based on [yabai](https://github.com/koekeishiya/yabai) by [@koekeishiya](https://github.com/koekeishiya).
+
+Also inspired by [skhd.zig](https://github.com/jackielii/skhd.zig).
 
 ## License
 
-MIT - see original yabai for its licensing terms.
+MIT

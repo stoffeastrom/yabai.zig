@@ -472,6 +472,37 @@ pub fn setAXFrame(ref: c.AXUIElementRef, frame: Rect) Error!void {
     };
 }
 
+/// Set window frame using a cached ax_ref - avoids AX lookup which fails cross-space.
+/// This is the preferred method for layout application.
+pub fn setFrameByRef(ax_ref: c.AXUIElementRef, wid: Id, frame: Rect) Error!void {
+    log.debug("setFrameByRef: wid={} frame=({},{} {}x{})", .{ wid, frame.x, frame.y, frame.width, frame.height });
+
+    if (ax_ref == null) {
+        log.err("setFrameByRef: null ax_ref for wid={}", .{wid});
+        return error.InvalidElement;
+    }
+
+    // Get pid from ax_ref to check enhanced UI
+    var pid: c.pid_t = 0;
+    if (c.c.AXUIElementGetPid(ax_ref, &pid) == 0 and pid != 0) {
+        const app = c.c.AXUIElementCreateApplication(pid);
+        if (app != null) {
+            defer c.c.CFRelease(app);
+
+            // Enhanced UI workaround
+            if (getEnhancedUserInterface(app)) {
+                log.debug("setFrameByRef: wid={} disabling enhanced UI", .{wid});
+                setEnhancedUserInterface(app, false);
+            }
+        }
+    }
+
+    setAXFrame(ax_ref, frame) catch |e| {
+        log.err("setFrameByRef: setAXFrame failed for wid={}: {}", .{ wid, e });
+        return e;
+    };
+}
+
 /// Check if app has enhanced user interface enabled
 fn getEnhancedUserInterface(app_ref: c.AXUIElementRef) bool {
     const kAXEnhancedUserInterface = c.cfstr("AXEnhancedUserInterface");
@@ -520,8 +551,13 @@ pub fn setFrameById(wid: Id, frame: Rect) Error!void {
     const kAXWindowsAttribute = c.cfstr("AXWindows");
     defer c.c.CFRelease(kAXWindowsAttribute);
 
-    if (c.c.AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &windows_ref) != 0) {
-        log.err("setFrameById: failed to get AXWindows for pid={}", .{pid});
+    const ax_err = c.c.AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &windows_ref);
+    if (ax_err != 0) {
+        log.err("setFrameById: failed to get AXWindows for pid={} err={}", .{ pid, ax_err });
+        return error.CannotComplete;
+    }
+    if (windows_ref == null) {
+        log.err("setFrameById: AXWindows is null for pid={}", .{pid});
         return error.CannotComplete;
     }
     defer c.c.CFRelease(windows_ref);
