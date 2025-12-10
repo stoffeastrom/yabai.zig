@@ -473,293 +473,233 @@ static uint64_t decode_adrp_add(uint64_t addr, uint64_t offset) {
     return (offset & 0xfffffffffffff000) + value_64 + imm12;
 }
 
-// Patterns from yabai arm64_payload.m
-const char *get_dock_spaces_pattern(NSOperatingSystemVersion os_version) {
-    if (os_version.majorVersion == 26) {
-        return "?8 ?? ?? ?? 08 ?? ?? 91 00 01 40 F9 E2 03 13 AA ?? ?? ?? 94 ?? ?? ?? ?? 08";
-    } else if (os_version.majorVersion == 15) {
-        return "?? 12 00 ?? ?? ?? ?? 91 ?? 02 40 F9 ?? ?? 00 B4 ?? ?? ?? ??";
-    } else if (os_version.majorVersion == 14) {
-        if (os_version.minorVersion > 0) {
-            return "36 16 00 ?? D6 ?? ?? 91 ?? 02 40 F9 ?? ?? 00 B4 ?? 03 14 AA";
+// ============================================================================
+// Runtime Pattern Extraction System
+// ============================================================================
+
+// Bootstrap patterns - minimal hardcoded patterns to find initial entry points
+// These are kept minimal and stable across versions
+const char *bootstrap_dock_spaces_pattern = "?? ?? ?? ?? 08 ?? ?? 91 00 01 40 F9";  // Common across recent macOS
+const char *bootstrap_dppm_pattern = "?? ?? ?? ?? 08 ?? ?? 91 00 01 40 F9";       // Similar structure
+
+// Runtime extraction state
+typedef struct {
+    uint64_t base_addr;
+    uint64_t slide;
+    uint64_t text_start;
+    uint64_t text_end;
+} runtime_context_t;
+
+static runtime_context_t g_runtime_ctx;
+
+// Initialize runtime context
+static bool init_runtime_context(void) {
+    g_runtime_ctx.base_addr = static_base_address();
+    g_runtime_ctx.slide = image_slide();
+
+    // Find __TEXT segment bounds for scanning
+    const struct mach_header_64 *header = (const struct mach_header_64 *)g_runtime_ctx.base_addr;
+    struct load_command *cmd = (struct load_command *)(header + 1);
+
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        if (cmd->cmd == LC_SEGMENT_64) {
+            struct segment_command_64 *seg = (struct segment_command_64 *)cmd;
+            if (strcmp(seg->segname, "__TEXT") == 0) {
+                g_runtime_ctx.text_start = seg->vmaddr + g_runtime_ctx.slide;
+                g_runtime_ctx.text_end = g_runtime_ctx.text_start + seg->vmsize;
+                return true;
+            }
         }
-        return "97 18 00 B0 F7 02 0F 91 E0 02 40 F9 E2 03 14 AA 1A 09 08 94 FD 03 1D AA 3C EF 07 94 F6 03 00 AA 00 01 00 B5 E0 02 40 F9 E2 03 14 AA 3B 0F 08 94 FD 03 1D AA 35 EF 07 94 F6 03 00 AA E0 00 00 B4 E0 03 15 AA E2 03 13 AA E3 03 16 AA F3 F3 07 94 E0 03 16 AA 1D EF 07 94 E0 03 14 AA";
-    } else if (os_version.majorVersion == 13) {
-        return "?? 17 00 ?? 73 ?? ?? 91 60 02 40 F9 E2 03 17 AA ?? ?? 07 94 FD 03 1D AA ?? ?? 07 94 E0 07 00 F9 ?? 16 00 ?? 00 ?? ?? F9 ?? ?? 07 94 02 00 80 D2 ?? ?? 07 94 E0 13 00 F9 60 02 40 F9 FC 1F 00 F9 E2 03 1C AA ?? ?? 07 94 FD 03 1D AA ?? ?? 07 94 F5 03 00 AA ?? 16 00 ?? ?? ?? ?? F9";
-    } else if (os_version.majorVersion == 12) {
-        return "55 21 00 ?? B5 ?? ?? 91 A0 02 40 F9 ?? 1F 00 ?? 01 ?? ?? F9 E2 03 1B AA ?? ?? 0C 94 FD 03 1D AA ?? ?? 0C 94 E0 13 00 F9 ?? 20 00 ?? 00 ?? ?? F9 ?? ?? 0C 94 E8 1F 00 ?? 13 ?? ?? F9 E1 03 13 AA 02 00 80 D2 ?? ?? 0C 94 E0 27 00 F9 A0 02 40 F9 08 20 00 ?? 01 ?? ?? F9";
+        cmd = (struct load_command *)((char *)cmd + cmd->cmdsize);
     }
-
-    return NULL;
+    return false;
 }
 
-const char *get_dppm_pattern(NSOperatingSystemVersion os_version) {
-    if (os_version.majorVersion == 26) {
-        return "?? 20 00 ?? 08 ?? ?? 91 00 01 40 F9 E2 03 16 AA E3 03 19 AA ?? ?? ?? 94";
-    } else if (os_version.majorVersion == 15) {
-        return "?? 0F 00 ?? ?? ?? ?? 91 ?? 0E 00 ?? ?? ?? ?? F8 ?? 03 40 F9 ?? ?? ??";
-    } else if (os_version.majorVersion == 14) {
-        if (os_version.minorVersion > 0) {
-            return "?? 10 00 ?? ?? ?? ?? 91 ?? 0F 00 D0 ?? ?? ?? F8 ?? 03 40 F9 ?? ?? ??";
-        }
-        return "E0 20 00 90 00 ?? ?? 91 E1 03 13 AA ?? ?? 0C 94 73 2D 00 B4 E1 20 00 90 21 ?? ?? 91 00 00 80 D2 D9 13 0C 94 A8 1F 00 F0 00 79 43 F9 A2 38 0C 94 FD 03 1D AA 1C 1E 0C 94 F4 03 00 AA BF 7F 37 A9";
-    } else if (os_version.majorVersion == 13) {
-        return "00 20 00 D0 00 ?? ?? 91 E1 03 13 AA ?? ?? 0B 94 13 2E 00 B4 16 20 00 D0 D6 ?? ?? 91 00 00 80 D2 E1 03 16 AA ?? ?? 0B 94 E8 1E 00 D0 00 ?? ?? F9 ?? ?? 0B 94 FD 03 1D AA ?? ?? 0B 94 F4 03 00 AA";
-    } else if (os_version.majorVersion == 12) {
-        return "?? 21 00 ?? 00 ?? ?? 91 E1 03 13 AA ?? ?? 0C 94 ?? ?? 00 B4 ?? 20 00 ?? 00 ?? ?? F9 ?? ?? 00 ?? 19 ?? ?? F9 E1 03 19 AA ?? ?? 0C 94 FD 03 1D AA ?? ?? 0C 94 F4 03 00 AA ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 00 ?? ?? ?? 00 ?? ?? ?? ?? ?? ?? ?? ?? ??";
-    }
+// Memory scanner for function discovery
+static uint64_t scan_for_pattern(const char *pattern, uint64_t search_start, uint64_t search_end) {
+    if (!pattern || search_end <= search_start) return 0;
 
-    return NULL;
-}
-
-const char *get_add_space_pattern(NSOperatingSystemVersion os_version) {
-    if (os_version.majorVersion == 26) {
-        return "7F 23 03 D5 FF C3 01 D1 E1 03 1E AA ?? ?? 00 94 FE 03 01 AA FD 7B 06 A9 FD 83 01 91 F3 03";
-    } else if (os_version.majorVersion == 15) {
-        return "7F 23 03 D5 FF C3 01 D1 E1 03 1E AA ?? ?? 00 94 FE 03 01 AA FD 7B 06 A9 FD 83 01 91 F3 03";
-    } else if (os_version.majorVersion == 14) {
-        return "7F 23 03 D5 FF C3 01 D1 E1 03 1E AA ?? ?? 00 94 FE 03 01 AA FD 7B 06 A9 FD 83 01 91 F5 03";
-    } else if (os_version.majorVersion == 13) {
-        return "7F 23 03 D5 FF C3 01 D1 E1 03 1E AA ?? ?? 00 94 FE 03 01 AA FD 7B 06 A9 FD 83 01 91 F5 03 14 AA F3 03 00 AA 89 E2 40 39 96 16 40 F9 C8 FE 7E D3 3F 05 00 71 A1 00 00 54 ?? 14 00 B5 C8 E2 7D 92 17 09 40 F9 ?? 00 00 14 ?? ?? 00 B5 C8 E2 7D 92 17 09 40 F9 ?? ?? 00 94 ?? ?? 00 B4 F8 06 00 F1 ?? 15 00 54 DA 0A 42 F2 E1 17 9F 1A E0 03 18 AA E2 03 16 AA ?? ?? ?? 97 ?? 14 00 B5 C8 0E 18 8B ?? ?? 00 94 F4 03 00 AA";
-    } else if (os_version.majorVersion == 12) {
-        return "7F 23 03 D5 FF C3 01 D1 E1 03 1E AA ?? ?? 00 94 FE 03 01 AA FD 7B 06 A9 FD 83 01 91 F5 03 14 AA F3 03 00 AA 89 E2 40 39 96 16 40 F9 C8 FE 7E D3 3F 05 00 71 A1 00 00 54 ?? 14 00 B5 C8 E2 7D 92 17 09 40 F9 ?? 00 00 14 ?? ?? 00 B5 C8 E2 7D 92 17 09 40 F9 ?? ?? 00 94 ?? ?? 00 B4 F8 06 00 F1 ?? 15 00 54 DA 0A 42 F2 E1 17 9F 1A E0 03 18 AA E2 03 16 AA ?? ?? FD 97 ?? 14 00 B5 C8 0E 18 8B ?? ?? 00 94 F4 03 00 AA";
-    }
-
-    return NULL;
-}
-
-const char *get_remove_space_pattern(NSOperatingSystemVersion os_version) {
-    if (os_version.majorVersion == 26) {
-        return "7F 23 03 D5 FF ?? ?? D1 FC ?? ?? A9 FA ?? ?? A9 F8 ?? ?? A9 F6 ?? ?? A9 F4 ?? ?? A9 FD ?? ?? A9 FD ?? ?? 91 ?? 03 03 AA F5 03 02 AA F4 03 01 AA";
-    } else if (os_version.majorVersion == 15) {
-        return "7F 23 03 D5 FF 83 ?? D1 FC 6F ?? A9 FA 67 ?? A9 F8 5F ?? A9 F6 57 ?? A9 F4 4F ?? A9 FD 7B ?? A9 FD 43 ?? 91 ?? 03 03 AA ?? 03 02 AA ?? 03 01 AA ?? 03 00 AA ?? ?? ?? AA";
-    } else if (os_version.majorVersion == 14) {
-        return "7F 23 03 D5 FF 83 ?? D1 FC 6F ?? A9 FA 67 ?? A9 F8 5F ?? A9 F6 57 ?? A9 F4 4F ?? A9 FD 7B ?? A9 FD 43 ?? 91 ?? 03 03 AA ?? 03 02 AA ?? 03 01 AA ?? 03 00 AA ?? ?? ?? 97 FC 03 00 AA 08 FC 7E D3 ?? ?? 00 B5 88 E3 7D 92 00";
-    } else if (os_version.majorVersion == 13) {
-        return "7F 23 03 D5 FF 83 ?? D1 FC 6F ?? A9 FA 67 ?? A9 F8 5F ?? A9 F6 57 ?? A9 F4 4F ?? A9 FD 7B ?? A9 FD 43 ?? 91 ?? 03 03 AA ?? 03 02 AA ?? 03 01 AA F3 03 00 AA ?? ?? FD 97 FC 03 00 AA 08 FC 7E D3 ?? 20 00 B5 88 E3 7D 92 00 09 40 F9 1F 08 00 F1 2B 0F 00 54 F5 53 01 A9 C8 0A 00 B0 1F 20 03 D5 08 ?? ?? F9 68 02 08 8B 14 55 40 A9 48 0B 00 F0 1F 20 03 D5 00 ?? ?? F9 28 0A 00 B0 01 ?? ?? F9 F3 13 00 F9";
-    } else if (os_version.majorVersion == 12) {
-        return "7F 23 03 D5 FF 83 03 D1 FC 6F 08 A9 FA 67 09 A9 F8 5F 0A A9 F6 57 0B A9 F4 4F 0C A9 FD 7B 0D A9 FD 43 03 91 F7 03 03 AA F6 03 02 AA F5 03 01 AA F3 03 00 AA F4 03 01 AA ?? ?? FD 97 F4 03 00 AA 08 FC 7E D3 ?? ?? 00 B5 88 E2 7D 92 00 09 40 F9 1F 08 00 F1 ?? 0E 00 54 ?? ?? ?? ?? F5 ?? ?? ?? ?? ?? 00 ?? 1F 20 03 D5 08 ?? ?? F9 68 02 08 8B 14 69 40 A9 ?? 0A 00 ?? 1F 20 03 D5 00 ?? ?? F9 48 09 00 ?? 01 ?? ?? F9 F3 ?? 00 F9 E2 03 13 AA";
-    }
-
-    return NULL;
-}
-
-const char *get_move_space_pattern(NSOperatingSystemVersion os_version) {
-    if (os_version.majorVersion == 26) {
-        return "7F 23 03 D5 E3 03 1E AA ?? ?? ?? 97 FE 03 03 AA FD 7B ?? A9 FD ?? ?? 91 F6 03 14 AA";
-    } else if (os_version.majorVersion == 15) {
-        return "7F 23 03 D5 E3 03 1E AA ?? ?? FF 97 FE 03 03 AA FD 7B 06 A9 FD 83 01 91 F6 03 14 AA F4 03 02 AA FB 03 01 AA FA 03 00 AA ?? 13 00 ?? E8 ?? ?? F9 19 68 68 F8 E0 03 19 AA E1 03 16 AA";
-    } else if (os_version.majorVersion == 14) {
-        return "7F 23 03 D5 FF C3 01 D1 E3 03 1E AA ?? ?? 00 94 FE 03 03 AA FD 7B 06 A9 FD 83 01 91 F6 03 14 AA F4 03 02 AA FA 03 01 AA FB 03 00 AA ?? ?? 00 ?? F7 ?? ?? 91 E8 02 40 F9 19 68 68 F8 E0 03 19 AA E1 03 16 AA ?? 25 00 94 ?? ?? 00 B4 ?? 03 00 AA ?? 03 01 AA";
-    } else if (os_version.majorVersion == 13) {
-        if (os_version.minorVersion >= 3) {
-            return "7F 23 03 D5 FF C3 01 D1 E3 03 1E AA EB 55 00 94 FE 03 03 AA FD 7B 06 A9 FD 83 01 91 F6 03 14 AA F4 03 02 AA FA 03 01 AA FB 03 00 AA 37 0B 00 D0 F7 82 19 91 E8 02 40 F9 19 68 68 F8 E0 03 19 AA E1 03 16 AA 42 25 00 94 80 01 00 B4 F5 03 00 AA F3 03 01 AA C8 0B 00 90 08 A1 1D 91 08 01 40 39 1F 05 00 71 E1 00 00 54 62 58 00 94 ED 9C 01 94 1F 58 00 94 C7 00 00 14 14 00 80 52 CA 00 00 14 1A 01 00 B4 E8 02 40 F9 40 6B 68 F8 E1 03 16 AA";
-        } else {
-            return "7F 23 03 D5 E3 03 1E AA ?? ?? 00 94 FE 03 03 AA FD 7B 06 A9 FD 83 01 91 ?? 03 14 AA ?? 03 02 AA FA 03 01 AA FB 03 00 AA ?? ?? 00 ?? ?? ?? ?? 91 ?? ?? 40 F9 ?? 68 68 F8 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 03 ?? AA ?? 03 ?? AA ?? ?? ?? ?? ?? ?? ?? ?? ?? 01 ?? ?? ?? ?? 00 ?? ?? ?? ?? ?? ?? ?? 00 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 00 ?? ?? 00 ?? ?? ?? ?? 00 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 00 ??";
-        }
-    } else if (os_version.majorVersion == 12) {
-        return "7F 23 03 D5 E3 03 1E AA ?? ?? 00 94 FE 03 03 AA FD 7B 06 A9 FD 83 01 91 ?? 03 14 AA ?? 03 02 AA FA 03 01 AA FB 03 00 AA ?? 0A 00 ?? ?? ?? ?? 91 ?? ?? 40 F9 ?? 68 68 F8 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 03 ?? AA ?? 03 ?? AA ?? ?? ?? ?? ?? ?? ?? ?? ?? 01 ?? ?? ?? ?? 00 ?? ?? ?? ?? ?? ?? ?? 00 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 00 ?? ?? 00 ?? ?? ?? ?? 00 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 00 ??";
-    }
-
-    return NULL;
-}
-
-// Search offsets from yabai arm64_payload.m
-static uint64_t get_dock_spaces_offset(NSOperatingSystemVersion os) {
-    if (os.majorVersion == 26) {
-        return 0x30000;
-    } else if (os.majorVersion == 15) {
-        return os.minorVersion >= 4 ? 0x1f0000 : 0x200000;
-    } else if (os.majorVersion == 14) {
-        return 0x114000;
-    } else if (os.majorVersion == 13) {
-        return 0x118000;
-    } else if (os.majorVersion == 12) {
-        return 0x8000;
-    }
-
-    return 0;
-}
-
-static uint64_t get_dppm_offset(NSOperatingSystemVersion os) {
-    if (os.majorVersion == 26) {
-        return 0x70000;
-    } else if (os.majorVersion == 15) {
-        return 0x250000;
-    } else if (os.majorVersion == 14) {
-        return os.minorVersion > 0 ? 0x1d2000 : 0x9000;
-    } else if (os.majorVersion == 13) {
-        return 0x9000;
-    } else if (os.majorVersion == 12) {
-        return 0x7000;
-    }
-
-    return 0;
-}
-
-static uint64_t get_add_space_offset(NSOperatingSystemVersion os) {
-    if (os.majorVersion == 26) {
-        return 0x250000;
-    } else if (os.majorVersion == 15) {
-        return 0x250000;
-    } else if (os.majorVersion == 14) {
-        return 0x1D0000;
-    } else if (os.majorVersion == 13) {
-        return 0x1E0000;
-    } else if (os.majorVersion == 12) {
-        return 0x220000;
-    }
-
-    return 0;
-}
-
-static uint64_t get_remove_space_offset(NSOperatingSystemVersion os) {
-    if (os.majorVersion == 26) {
-        return 0x1e0000;
-    } else if (os.majorVersion == 15) {
-        return 0x1c0000;
-    } else if (os.majorVersion == 14) {
-        return 0x280000;
-    } else if (os.majorVersion == 13) {
-        return 0x2A0000;
-    } else if (os.majorVersion == 12) {
-        return 0x2E0000;
-    }
-
-    return 0;
-}
-
-static uint64_t get_move_space_offset(NSOperatingSystemVersion os) {
-    if (os.majorVersion == 26) {
-        return 0x1c0000;
-    } else if (os.majorVersion == 15) {
-        return 0x1c0000;
-    } else if (os.majorVersion == 14) {
-        return 0x280000;
-    } else if (os.majorVersion == 13) {
-        return 0x290000;
-    } else if (os.majorVersion == 12) {
-        return 0x2D0000;
-    }
-
-    return 0;
-}
-
-#endif
-
-static bool verify_os_version(void) {
-    NSOperatingSystemVersion os = [[NSProcessInfo processInfo] operatingSystemVersion];
-    g_macOSSequoia = (os.majorVersion == 15);
-    return (os.majorVersion >= 12 && os.majorVersion <= 26);
-}
-
-static uint64_t static_base_address(void) {
-    const struct mach_header_64 *header = (struct mach_header_64 *)_dyld_get_image_header(0);
-    return (uint64_t)header;
-}
-
-static uint64_t image_slide(void) {
-    return _dyld_get_image_vmaddr_slide(0);
-}
-
-static uint64_t hex_find_seq(uint64_t addr, const char *pattern) {
-    if (!pattern) return 0;
-    
     size_t pattern_len = strlen(pattern);
     if (pattern_len % 2 != 0) return 0;
-    
+
     uint8_t *bytes = malloc(pattern_len / 2);
     if (!bytes) return 0;
-    
+
     for (size_t i = 0; i < pattern_len; i += 2) {
         char byte_str[3] = {pattern[i], pattern[i+1], '\0'};
         bytes[i/2] = (uint8_t)strtol(byte_str, NULL, 16);
     }
-    
-    uint64_t result = 0;
-    uint8_t *search_addr = (uint8_t *)addr;
-    for (size_t i = 0; i < 0x100000; i++) {  // Search up to 1MB
-        if (memcmp(search_addr + i, bytes, pattern_len / 2) == 0) {
-            result = addr + i;
-            break;
+
+    size_t byte_len = pattern_len / 2;
+    uint8_t *search_ptr = (uint8_t *)search_start;
+
+    for (uint64_t addr = search_start; addr < search_end - byte_len; addr += 1) {
+        if (memcmp((void *)addr, bytes, byte_len) == 0) {
+            free(bytes);
+            return addr;
         }
     }
-    
+
     free(bytes);
-    return result;
+    return 0;
 }
 
-static void discover_functions(void) {
-    NSOperatingSystemVersion os = [[NSProcessInfo processInfo] operatingSystemVersion];
-    
-    // Initialize base address
-    baseaddr = static_base_address() + image_slide();
-    
-    // Debug file - use fixed path that Dock can write to
-    FILE *df = fopen("/tmp/yabai.zig-sa-discover.log", "w");
-    if (df) { fprintf(df, "discover_functions: macOS %ld.%ld baseaddr=0x%llx\n", os.majorVersion, os.minorVersion, baseaddr); fflush(df); }
-    
-#ifdef __arm64__
-#endif
-    
-    // Find dock_spaces global
-    const char *dock_spaces_pattern = get_dock_spaces_pattern(os);
-    uint64_t dock_spaces_addr = dock_spaces_pattern ? hex_find_seq(baseaddr + get_dock_spaces_offset(os), dock_spaces_pattern) : 0;
-    if (dock_spaces_addr) {
-        uint64_t offset = decode_adrp_add(dock_spaces_addr, dock_spaces_addr - baseaddr);
-        g_dock_spaces = (__bridge id)(*(void **)(baseaddr + offset));
-        if (df) { fprintf(df, "dock_spaces: addr=0x%llx offset=0x%llx obj=%p\n", dock_spaces_addr, offset, g_dock_spaces); fflush(df); }
-    } else {
-        if (df) { fprintf(df, "dock_spaces: NOT FOUND\n"); fflush(df); }
-    }
-    
-    // Find dp_desktop_picture_manager global
-    const char *dppm_pattern = get_dppm_pattern(os);
-    uint64_t dppm_addr = dppm_pattern ? hex_find_seq(baseaddr + get_dppm_offset(os), dppm_pattern) : 0;
-    if (dppm_addr) {
-        uint64_t offset = decode_adrp_add(dppm_addr, dppm_addr - baseaddr);
-        g_dp_desktop_picture_manager = (__bridge id)(*(void **)(baseaddr + offset));
-        if (df) { fprintf(df, "dppm: addr=0x%llx offset=0x%llx obj=%p\n", dppm_addr, offset, g_dp_desktop_picture_manager); fflush(df); }
-        // Sonoma workaround: try 8 bytes before if null
-        if (!g_dp_desktop_picture_manager) {
-            g_dp_desktop_picture_manager = (__bridge id)(*(void **)(baseaddr + offset - 0x8));
-            if (df) { fprintf(df, "dppm (retry -8): obj=%p\n", g_dp_desktop_picture_manager); fflush(df); }
+// Cross-reference analysis to find related functions
+static uint64_t find_cross_reference(uint64_t target_addr, uint64_t search_start, uint64_t search_end) {
+    // Look for ADRP + ADD patterns that reference our target
+    uint64_t target_page = target_addr & ~0xFFFULL;
+
+    for (uint64_t addr = search_start; addr < search_end - 8; addr += 4) {
+        uint32_t instr1 = *(uint32_t *)addr;
+        uint32_t instr2 = *(uint32_t *)(addr + 4);
+
+        // Check for ADRP instruction
+        if ((instr1 & 0x9F000000) == 0x90000000) {
+            // Decode ADRP
+            uint32_t immlo = (instr1 >> 29) & 0x3;
+            uint32_t immhi = (instr1 >> 5) & 0x7FFFF;
+            int64_t adrp_offset = ((immhi << 2) | immlo) << 12;
+            int64_t page_addr = (addr & ~0xFFFULL) + adrp_offset;
+
+            if (page_addr == target_page) {
+                // Check if next instruction is ADD that gives us the target
+                if ((instr2 & 0xFFC00000) == 0x91000000) {  // ADD instruction
+                    uint32_t imm12 = (instr2 >> 10) & 0xFFF;
+                    uint64_t computed_addr = page_addr + imm12;
+
+                    if (computed_addr == target_addr) {
+                        return addr;  // Found the referencing location
+                    }
+                }
+            }
         }
-    } else {
-        if (df) { fprintf(df, "dppm: NOT FOUND\n"); fflush(df); }
     }
-    
-    // Find add_space function
-    const char *add_space_pattern = get_add_space_pattern(os);
-    uint64_t add_space_addr = add_space_pattern ? hex_find_seq(baseaddr + get_add_space_offset(os), add_space_pattern) : 0;
-    if (add_space_addr) {
-        g_add_space_fp = (uint64_t)ptrauth_sign_unauthenticated((void *)add_space_addr, ptrauth_key_asia, 0);
-        if (df) { fprintf(df, "add_space: addr=0x%llx fp=0x%llx\n", add_space_addr, g_add_space_fp); fflush(df); }
-    } else {
-        if (df) { fprintf(df, "add_space: NOT FOUND\n"); fflush(df); }
+    return 0;
+}
+
+// Extract function address from ADRP+ADD sequence
+static uint64_t extract_function_address(uint64_t pattern_addr) {
+    if (!pattern_addr) return 0;
+
+    uint32_t adrp_instr = *(uint32_t *)pattern_addr;
+    uint32_t add_instr = *(uint32_t *)(pattern_addr + 4);
+
+    // Decode ADRP
+    uint32_t immlo = (adrp_instr >> 29) & 0x3;
+    uint32_t immhi = (adrp_instr >> 5) & 0x7FFFF;
+    int64_t adrp_offset = ((immhi << 2) | immlo) << 12;
+    uint64_t page_base = (pattern_addr & ~0xFFFULL) + adrp_offset;
+
+    // Decode ADD
+    uint32_t imm12 = (add_instr >> 10) & 0xFFF;
+    uint64_t final_addr = page_base + imm12;
+
+    return final_addr;
+}
+
+// Advanced function discovery using cross-references
+static uint64_t discover_function_by_cross_refs(uint64_t known_addr, const char *signature_pattern) {
+    if (!known_addr) return 0;
+
+    // Find all locations that reference our known address
+    uint64_t xref_addr = find_cross_reference(known_addr, g_runtime_ctx.text_start, g_runtime_ctx.text_end);
+    if (!xref_addr) return 0;
+
+    // Look for the signature pattern near the cross-reference
+    uint64_t search_start = xref_addr - 0x1000;  // Search 4KB before
+    uint64_t search_end = xref_addr + 0x1000;    // Search 4KB after
+
+    if (search_start < g_runtime_ctx.text_start) search_start = g_runtime_ctx.text_start;
+    if (search_end > g_runtime_ctx.text_end) search_end = g_runtime_ctx.text_end;
+
+    uint64_t pattern_addr = scan_for_pattern(signature_pattern, search_start, search_end);
+    if (pattern_addr) {
+        return extract_function_address(pattern_addr);
     }
-    
-    // Find remove_space function
-    const char *remove_space_pattern = get_remove_space_pattern(os);
-    uint64_t remove_space_addr = remove_space_pattern ? hex_find_seq(baseaddr + get_remove_space_offset(os), remove_space_pattern) : 0;
-    if (remove_space_addr) {
-        g_remove_space_fp = (uint64_t)ptrauth_sign_unauthenticated((void *)remove_space_addr, ptrauth_key_asia, 0);
-        if (df) { fprintf(df, "remove_space: addr=0x%llx fp=0x%llx\n", remove_space_addr, g_remove_space_fp); fflush(df); }
-    } else {
-        if (df) { fprintf(df, "remove_space: NOT FOUND\n"); fflush(df); }
+
+    return 0;
+}
+
+// Bootstrap discovery using minimal patterns
+static uint64_t bootstrap_find_global(const char *pattern, uint64_t search_offset) {
+    uint64_t search_addr = g_runtime_ctx.base_addr + g_runtime_ctx.slide + search_offset;
+    uint64_t pattern_addr = scan_for_pattern(pattern, search_addr, search_addr + 0x100000);
+
+    if (pattern_addr) {
+        return extract_function_address(pattern_addr);
     }
-    
-    // Find move_space function
-    const char *move_space_pattern = get_move_space_pattern(os);
-    uint64_t move_space_addr = move_space_pattern ? hex_find_seq(baseaddr + get_move_space_offset(os), move_space_pattern) : 0;
-    if (move_space_addr) {
-        g_move_space_fp = (uint64_t)ptrauth_sign_unauthenticated((void *)move_space_addr, ptrauth_key_asia, 0);
-        if (df) { fprintf(df, "move_space: addr=0x%llx fp=0x%llx\n", move_space_addr, g_move_space_fp); fflush(df); }
-    } else {
-        if (df) { fprintf(df, "move_space: NOT FOUND\n"); fflush(df); }
+    return 0;
+}
+
+// Main runtime extraction function
+static void discover_functions_runtime(void) {
+    // Initialize runtime context
+    if (!init_runtime_context()) {
+        FILE *df = fopen("/tmp/yabai.zig-sa-discover.log", "w");
+        if (df) { fprintf(df, "Failed to initialize runtime context\n"); fclose(df); }
+        return;
     }
-    
-    if (df) fclose(df);
+
+    // Debug logging
+    FILE *df = fopen("/tmp/yabai.zig-sa-discover.log", "w");
+    if (df) {
+        fprintf(df, "Runtime extraction: base=0x%llx slide=0x%llx text=0x%llx-0x%llx\n",
+                g_runtime_ctx.base_addr, g_runtime_ctx.slide,
+                g_runtime_ctx.text_start, g_runtime_ctx.text_end);
+        fflush(df);
+    }
+
+    // Phase 1: Bootstrap with minimal patterns to find initial globals
+    uint64_t dock_spaces_addr = bootstrap_find_global(bootstrap_dock_spaces_pattern, 0x30000);
+    if (dock_spaces_addr) {
+        g_dock_spaces = (__bridge id)(*(void **)dock_spaces_addr);
+        if (df) { fprintf(df, "Found dock_spaces at 0x%llx: %p\n", dock_spaces_addr, g_dock_spaces); fflush(df); }
+    }
+
+    uint64_t dppm_addr = bootstrap_find_global(bootstrap_dppm_pattern, 0x70000);
+    if (dppm_addr) {
+        g_dp_desktop_picture_manager = (__bridge id)(*(void **)dppm_addr);
+        if (df) { fprintf(df, "Found dppm at 0x%llx: %p\n", dppm_addr, g_dp_desktop_picture_manager); fflush(df); }
+    }
+
+    // Phase 2: Use cross-references to find function addresses
+    // This is where the magic happens - we chain discovery from known globals
+
+    // Find add_space by looking for functions that reference dock_spaces
+    if (g_dock_spaces) {
+        uint64_t dock_spaces_ptr = (uint64_t)g_dock_spaces;
+        g_add_space_fp = discover_function_by_cross_refs(dock_spaces_ptr, "7F 23 03 D5 FF C3 01 D1");  // Function prologue
+        if (g_add_space_fp) {
+            g_add_space_fp = (uint64_t)ptrauth_sign_unauthenticated((void *)g_add_space_fp, ptrauth_key_asia, 0);
+            if (df) { fprintf(df, "Found add_space at 0x%llx\n", g_add_space_fp); fflush(df); }
+        }
+    }
+
+    // Find remove_space by looking for functions that reference dock_spaces with different signature
+    if (g_dock_spaces) {
+        uint64_t dock_spaces_ptr = (uint64_t)g_dock_spaces;
+        g_remove_space_fp = discover_function_by_cross_refs(dock_spaces_ptr, "7F 23 03 D5 FF ?? ?? D1");  // Different prologue
+        if (g_remove_space_fp) {
+            g_remove_space_fp = (uint64_t)ptrauth_sign_unauthenticated((void *)g_remove_space_fp, ptrauth_key_asia, 0);
+            if (df) { fprintf(df, "Found remove_space at 0x%llx\n", g_remove_space_fp); fflush(df); }
+        }
+    }
+
+    // Find move_space by looking for functions that reference dppm
+    if (g_dp_desktop_picture_manager) {
+        uint64_t dppm_ptr = (uint64_t)g_dp_desktop_picture_manager;
+        g_move_space_fp = discover_function_by_cross_refs(dppm_ptr, "7F 23 03 D5 E3 03 1E AA");
+        if (g_move_space_fp) {
+            g_move_space_fp = (uint64_t)ptrauth_sign_unauthenticated((void *)g_move_space_fp, ptrauth_key_asia, 0);
+            if (df) { fprintf(df, "Found move_space at 0x%llx\n", g_move_space_fp); fflush(df); }
+        }
+    }
+
+    if (df) {
+        fprintf(df, "Runtime discovery complete: dock=%p dppm=%p add=0x%llx rm=0x%llx mv=0x%llx\n",
+                g_dock_spaces, g_dp_desktop_picture_manager, g_add_space_fp, g_remove_space_fp, g_move_space_fp);
+        fclose(df);
+    }
 }
 
 __attribute__((constructor))
