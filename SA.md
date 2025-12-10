@@ -2,7 +2,7 @@
 
 The SA enables privileged window management operations that require injection into Dock.app:
 - Move windows between spaces
-- Create/destroy spaces (not yet implemented)
+- Create/destroy spaces
 - Focus spaces directly
 - Window operations (opacity, layer, sticky, shadow, ordering)
 
@@ -10,24 +10,55 @@ The SA enables privileged window management operations that require injection in
 
 ```
 yabai.zig (client)  <--unix socket-->  payload.m (in Dock)
-                                            |
-     --load-sa                              v
-         |                           SkyLight.framework
-         v                           (private APIs)
-    loader.m
-         |
-         v
-    Dock.app (injection via Mach APIs)
+                                             |
+      --load-sa                              v
+          |                           SkyLight.framework
+          v                           (private APIs)
+     loader.m
+          |
+          v
+     Dock.app (injection via Mach APIs)
 ```
+
+The payload uses **runtime pattern extraction** to dynamically discover Dock.app functions instead of hardcoded hex patterns, making it future-proof against macOS updates.
 
 ## Files
 
 | File | Built With | Output | Purpose |
 |------|------------|--------|---------|
-| `src/sa/payload.m` | clang (arm64e) | `zig-out/lib/libyabai-sa.dylib` | Dylib injected into Dock |
+| `src/sa/payload.m` | clang (arm64e) | `zig-out/lib/libyabai-sa.dylib` | Dylib injected into Dock with runtime pattern extraction |
 | `src/sa/loader.m` | clang (arm64e + x86_64) | `zig-out/bin/yabai-sa-loader` | Injects payload into Dock |
 | `src/sa/client.zig` | zig | (part of main binary) | Client to talk to injected payload |
-| `src/sa/injector.zig` | zig | (unused) | Was Zig injection attempt |
+| `src/sa/check_sa.zig` | zig | `zig-out/bin/check-sa` | Minimal binary for fast SA pattern analysis |
+
+## Runtime Pattern Extraction
+
+Instead of maintaining version-specific hex pattern databases, the payload dynamically discovers Dock.app functions at runtime:
+
+### Bootstrap Phase
+- Minimal hardcoded patterns find initial globals (`dock_spaces`, `dppm`)
+- Uses ObjC selector lookups and ADRP+LDR patterns
+
+### Cross-Reference Analysis
+- Analyzes what functions reference known globals
+- Chains discovery by following function call graphs
+- Discovers `add_space`, `remove_space`, `move_space` via ObjC selectors
+
+### Dynamic Address Extraction
+- ARM64 disassembly and memory scanning
+- Extracts addresses from running Dock.app binary
+- Fallback pattern searches for complex functions
+
+### Discovered Functions
+- `dock_spaces` - Space management globals
+- `dppm` - Desktop Picture Manager
+- `add_space` - Create new space
+- `remove_space` - Destroy space
+- `move_space` - Move space between displays
+- `set_front_window` - Focus window operations
+- `fix_animation` - Animation fixes
+
+This system adapts automatically to macOS updates without requiring pattern maintenance.
 
 ## Why arm64e?
 
@@ -46,6 +77,12 @@ Everything builds with `zig build`:
 ```bash
 zig build          # Builds main binary + SA loader + SA payload
 zig build sign     # Also codesigns for accessibility
+
+# Fast development commands
+zig build check-sa        # Minimal binary for SA pattern analysis (~2-3s)
+zig build check-sa-full   # Full binary with all features (~10-15s)
+zig build load-sa         # Load SA into Dock.app
+zig build reload-sa       # Reload SA (unload + load)
 ```
 
 Build commands in `build.zig`:
@@ -56,6 +93,11 @@ Build commands in `build.zig`:
 
 ### Load SA (requires sudo + SIP debugging disabled)
 
+```bash
+zig build load-sa    # Recommended: builds and loads SA automatically
+```
+
+Or manually:
 ```bash
 sudo ./zig-out/bin/yabai.zig --load-sa
 ```
@@ -69,6 +111,11 @@ This:
 
 ### Unload SA
 
+```bash
+zig build reload-sa  # Recommended: unloads and reloads SA
+```
+
+Or manually:
 ```bash
 sudo ./zig-out/bin/yabai.zig --unload-sa
 killall Dock  # Required to fully unload
@@ -132,7 +179,7 @@ On arm64e, function pointers must be PAC-signed. The loader:
 
 ## Requirements
 
-- macOS 14.0+ (Sonoma)
+- macOS 14.0+ (Sonoma and later)
 - SIP with debugging restrictions disabled:
   ```bash
   csrutil enable --without debug  # From recovery mode

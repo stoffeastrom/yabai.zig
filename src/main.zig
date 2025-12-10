@@ -44,7 +44,6 @@ pub const Response = @import("ipc/Response.zig");
 
 // SA pattern extraction (used for auto-discovery at daemon startup)
 pub const sa_extractor = @import("sa/extractor.zig");
-pub const sa_injector = @import("sa/injector.zig");
 
 const log = std.log.scoped(.yabai);
 
@@ -859,7 +858,7 @@ fn loadSA() u8 {
     }
 
     // Check if already injected
-    if (sa_injector.isAlreadyInjected()) {
+    if (checkSAAvailable()) {
         stdout.writeAll("yabai.zig: scripting-addition already loaded\n") catch {};
         return 0;
     }
