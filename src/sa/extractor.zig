@@ -373,8 +373,24 @@ pub fn discoverFunctions(allocator: std.mem.Allocator, binary_data: []const u8) 
     const text = macho.text_section orelse return result;
     const text_data = binary_data[text.offset..][0..@intCast(text.size)];
 
-    // dppm: Look for ADRP+LDR pattern that loads from high __DATA address and then LDR from that pointer
-    // Pattern: ADRP Xn, page; LDR Xn, [Xn, #off]; LDR Xm, [Xn] (double dereference)
+    // dock_spaces: Look for the pattern from patterns.zig
+    const dock_spaces_idx = @intFromEnum(patterns.FunctionType.dock_spaces);
+    if (!result.functions[dock_spaces_idx].found) {
+        result.diagnostics[dock_spaces_idx].fallback_used = true;
+        result.diagnostics[dock_spaces_idx].method = "pattern search";
+        if (findDockSpacesPattern(text_data, text.addr, text.offset)) |addr| {
+            result.functions[dock_spaces_idx] = .{
+                .func = .dock_spaces,
+                .found = true,
+                .address = addr,
+                .file_offset = addr - 0x100000000,
+            };
+        } else {
+            result.diagnostics[dock_spaces_idx].notes = "Pattern not found in TEXT segment";
+        }
+    }
+
+    // dppm: Look for ADRP+LDR+LDR pattern that loads from high __DATA address and then LDR from that pointer
     const dppm_idx = @intFromEnum(patterns.FunctionType.dppm);
     if (!result.functions[dppm_idx].found) {
         result.diagnostics[dppm_idx].fallback_used = true;
@@ -430,7 +446,28 @@ pub fn discoverFunctions(allocator: std.mem.Allocator, binary_data: []const u8) 
     return result;
 }
 
-/// Find dppm global pointer via pattern matching
+/// Find dock_spaces via pattern matching from patterns.zig
+fn findDockSpacesPattern(text_data: []const u8, text_addr: u64, _: u64) ?u64 {
+    const os_version = getCurrentOSVersion() catch return null;
+    const pattern_set = patterns.getPatternSet(os_version, .arm64) orelse return null;
+    const pattern = pattern_set.dock_spaces;
+
+    // Compile the pattern
+    var compiled = compilePattern(std.heap.page_allocator, pattern.pattern) catch return null;
+    defer compiled.deinit(std.heap.page_allocator);
+
+    // Search within the expected offset range
+    const search_start = @min(pattern.offset, text_data.len);
+    const search_end = @min(pattern.offset + 0x100000, text_data.len);
+
+    if (findPattern(text_data[search_start..search_end], compiled, search_end - search_start)) |offset| {
+        return text_addr + search_start + offset;
+    }
+
+    return null;
+}
+
+/// Find dppm via ADRP+LDR+LDR pattern that loads from high __DATA address
 fn findDppmPattern(text_data: []const u8, text_addr: u64) ?u64 {
     // Look for code that loads a global pointer and then dereferences it
     // This is characteristic of accessing a global object pointer like gDesktopPictureManager

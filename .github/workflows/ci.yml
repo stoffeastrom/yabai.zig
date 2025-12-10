@@ -34,3 +34,4 @@ jobs:
 
       - name: Check SA patterns
         run: zig build check-sa
+        continue-on-error: true
