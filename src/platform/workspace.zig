@@ -355,9 +355,9 @@ test "objc.getClass for known class" {
 
 test "getOSVersion returns valid macOS version" {
     const v = getOSVersion();
-    // macOS versions: 10.x, 11.x (Big Sur), 12.x (Monterey), 13.x (Ventura), 14.x (Sonoma), 15.x (Sequoia)
+    // macOS versions: 10.x, 11.x (Big Sur), 12.x (Monterey), 13.x (Ventura), 14.x (Sonoma), 15.x (Sequoia), 26.x (preview)
     try std.testing.expect(v.major >= 10);
-    try std.testing.expect(v.major <= 20); // reasonable upper bound
+    try std.testing.expect(v.major <= 50); // reasonable upper bound for future versions
     try std.testing.expect(v.minor >= 0);
     try std.testing.expect(v.patch >= 0);
 }
