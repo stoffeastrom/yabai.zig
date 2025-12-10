@@ -190,7 +190,7 @@ pub const known_arm64 = struct {
         },
         .fix_animation = .{
             .offset = 0x1D0000,
-            .pattern = "00 10 6A 1E E0 03 14 AA ?? 03 ?? AA",
+            .pattern = "00 10 6A 1E A8 ?? ?? D1 ?? 01 ?? F8",
         },
     };
 
