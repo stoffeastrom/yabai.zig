@@ -12,7 +12,7 @@ zig build dev
 
 ## Credits
 
-Based on [yabai](https://github.com/koekeishiya/yabai) by [@koekeishiya](https://github.com/koekeishiya).
+Based on [yabai](https://github.com/koekeishiya/yabai) by [@asmvik](https://github.com/asmvik).
 
 ## License
 
