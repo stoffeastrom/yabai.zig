@@ -152,4 +152,44 @@ pub fn build(b: *std.Build) void {
 
     const run_exe_tests = b.addRunArtifact(exe_tests);
     test_step.dependOn(&run_exe_tests.step);
+
+    // Fast check-sa executable for development
+    const check_sa_mod = b.createModule(.{
+        .root_source_file = b.path("src/sa/check_sa.zig"),
+        .target = target,
+        .optimize = .Debug, // Fast builds for development
+    });
+    check_sa_mod.linkSystemLibrary("c", .{});
+
+    const check_sa_exe = b.addExecutable(.{
+        .name = "yabai.zig-check-sa",
+        .root_module = check_sa_mod,
+    });
+
+    b.installArtifact(check_sa_exe);
+
+    // Check SA step - fast analysis for development
+    const check_sa_step = b.step("check-sa", "Fast SA pattern analysis (development)");
+    const check_sa_fast_run = b.addRunArtifact(check_sa_exe);
+    check_sa_step.dependOn(&check_sa_fast_run.step);
+
+    // Full check-sa (builds entire binary first)
+    const check_sa_full_step = b.step("check-sa-full", "Full SA analysis (builds complete binary)");
+    const check_sa_run = b.addRunArtifact(exe);
+    check_sa_run.addArgs(&.{"--check-sa"});
+    check_sa_full_step.dependOn(b.getInstallStep());
+    check_sa_full_step.dependOn(&check_sa_run.step);
+
+    // SA management steps (use full binary)
+    const load_sa_step = b.step("load-sa", "Install and load scripting addition (requires sudo)");
+    const load_sa_run = b.addRunArtifact(exe);
+    load_sa_run.addArgs(&.{"--load-sa"});
+    load_sa_step.dependOn(b.getInstallStep());
+    load_sa_step.dependOn(&load_sa_run.step);
+
+    const reload_sa_step = b.step("reload-sa", "Kill Dock and re-inject SA (requires sudo)");
+    const reload_sa_run = b.addRunArtifact(exe);
+    reload_sa_run.addArgs(&.{"--reload-sa"});
+    reload_sa_step.dependOn(b.getInstallStep());
+    reload_sa_step.dependOn(&reload_sa_run.step);
 }

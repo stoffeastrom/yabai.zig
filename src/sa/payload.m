@@ -473,6 +473,15 @@ static uint64_t decode_adrp_add(uint64_t addr, uint64_t offset) {
     return (offset & 0xfffffffffffff000) + value_64 + imm12;
 }
 
+static uint64_t static_base_address(void) {
+    const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    return (uint64_t)header;
+}
+
+static uint64_t image_slide(void) {
+    return _dyld_get_image_vmaddr_slide(0);
+}
+
 // ============================================================================
 // Runtime Pattern Extraction System
 // ============================================================================
@@ -633,6 +642,12 @@ static uint64_t bootstrap_find_global(const char *pattern, uint64_t search_offse
 
 // Main runtime extraction function
 static void discover_functions_runtime(void) {
+    // IMMEDIATE DEBUG: This should appear if our function is called
+    FILE *test_df = fopen("/tmp/yabai.zig-RUNTIME-EXTRACTION.log", "w");
+    if (test_df) {
+        fprintf(test_df, "RUNTIME EXTRACTION FUNCTION CALLED!\n");
+        fclose(test_df);
+    }
     // Initialize runtime context
     if (!init_runtime_context()) {
         FILE *df = fopen("/tmp/yabai.zig-sa-discover.log", "w");
@@ -650,16 +665,22 @@ static void discover_functions_runtime(void) {
     }
 
     // Phase 1: Bootstrap with minimal patterns to find initial globals
+    if (df) { fprintf(df, "Starting bootstrap phase...\n"); fflush(df); }
+    
     uint64_t dock_spaces_addr = bootstrap_find_global(bootstrap_dock_spaces_pattern, 0x30000);
     if (dock_spaces_addr) {
         g_dock_spaces = (__bridge id)(*(void **)dock_spaces_addr);
-        if (df) { fprintf(df, "Found dock_spaces at 0x%llx: %p\n", dock_spaces_addr, g_dock_spaces); fflush(df); }
+        if (df) { fprintf(df, "BOOTSTRAP: Found dock_spaces at 0x%llx: %p\n", dock_spaces_addr, g_dock_spaces); fflush(df); }
+    } else {
+        if (df) { fprintf(df, "BOOTSTRAP: dock_spaces NOT FOUND\n"); fflush(df); }
     }
 
     uint64_t dppm_addr = bootstrap_find_global(bootstrap_dppm_pattern, 0x70000);
     if (dppm_addr) {
         g_dp_desktop_picture_manager = (__bridge id)(*(void **)dppm_addr);
-        if (df) { fprintf(df, "Found dppm at 0x%llx: %p\n", dppm_addr, g_dp_desktop_picture_manager); fflush(df); }
+        if (df) { fprintf(df, "BOOTSTRAP: Found dppm at 0x%llx: %p\n", dppm_addr, g_dp_desktop_picture_manager); fflush(df); }
+    } else {
+        if (df) { fprintf(df, "BOOTSTRAP: dppm NOT FOUND\n"); fflush(df); }
     }
 
     // Phase 2: Use cross-references to find function addresses
@@ -701,6 +722,13 @@ static void discover_functions_runtime(void) {
         fclose(df);
     }
 }
+#endif
+
+static bool verify_os_version(void) {
+    NSOperatingSystemVersion os = [[NSProcessInfo processInfo] operatingSystemVersion];
+    g_macOSSequoia = (os.majorVersion == 15);
+    return (os.majorVersion >= 12 && os.majorVersion <= 26);
+}
 
 __attribute__((constructor))
 static void payload_init(void) {
@@ -740,7 +768,7 @@ static void payload_init(void) {
     
     if (ef) { fprintf(ef, "socket setup done at %s\n", g_socket_path); fflush(ef); }
     
-    discover_functions();
+    discover_functions_runtime();
     
     if (ef) { 
         fprintf(ef, "discover done: dock=%p dppm=%p add=0x%llx rm=0x%llx mv=0x%llx\n", 
