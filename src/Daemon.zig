@@ -18,6 +18,8 @@ const Config = @import("config/Config.zig");
 const WorkspaceObserver = @import("platform/WorkspaceObserver.zig").WorkspaceObserver;
 const Event = @import("events/Event.zig").Event;
 const Store = @import("events/Store.zig").Store;
+const Mouse = @import("events/Mouse.zig");
+const InsertFeedback = @import("events/InsertFeedback.zig").InsertFeedback;
 const sa_extractor = @import("sa/extractor.zig");
 const sa_patterns = @import("sa/patterns.zig");
 const SAClient = @import("sa/client.zig").Client;
@@ -93,6 +95,16 @@ pub const Daemon = struct {
 
     // Event tap for focus follows mouse
     mouse_tap: observers.MouseEventTap = .{},
+    // Event tap for modifier+drag window operations
+    mouse_drag_tap: observers.MouseDragTap = .{},
+    // Mouse drag state (for window move/resize with modifiers)
+    mouse_state: Mouse.State = .{},
+    // Insert feedback state (for automatic drag/drop without modifier)
+    insert_feedback: ?InsertFeedback = null,
+    dragging_window_id: ?Window.Id = null, // Window currently being dragged by user
+    drag_target_wid: ?Window.Id = null, // Target window for drop
+    drag_drop_action: Mouse.DropAction = .none, // Determined drop action
+    last_window_moved_time: i64 = 0, // Timestamp of last window_moved event
     ffm_window_id: u32 = 0, // One-shot: window ID that FFM is currently focusing (cleared on focus confirm)
     last_ffm_time: i64 = 0, // Timestamp of last FFM focus attempt (nanoseconds)
     last_validation_time: i64 = 0, // Timestamp of last state validation
@@ -237,6 +249,25 @@ pub const Daemon = struct {
     /// Stop mouse event tap
     pub fn stopMouseEventTap(self: *Self) void {
         self.mouse_tap.stop();
+    }
+
+    /// Start mouse drag tap for modifier+click window operations
+    pub fn startMouseDragTap(self: *Self) void {
+        if (self.mouse_drag_tap.tap != null) return;
+
+        // Initialize mouse state with feedback support
+        self.mouse_state = Mouse.State.initWithConnection(self.connection);
+        self.mouse_state.feedback_color = self.config.insert_feedback_color;
+
+        if (self.mouse_drag_tap.start(mouseDragCallback)) {
+            log.info("mouse drag tap enabled", .{});
+        }
+    }
+
+    /// Stop mouse drag tap
+    pub fn stopMouseDragTap(self: *Self) void {
+        self.mouse_drag_tap.stop();
+        self.mouse_state.deinit();
     }
 
     /// Start display reconfiguration observer
@@ -427,6 +458,9 @@ pub const Daemon = struct {
         if (event_type != c.c.kCGEventMouseMoved) return event;
         if (self.config.focus_follows_mouse == .disabled) return event;
 
+        // Suppress FFM during window drag operations
+        if (self.dragging_window_id != null) return event;
+
         // Debounce: skip if last focus attempt was too recent (50ms)
         const now: i64 = @truncate(std.time.nanoTimestamp());
         const elapsed_ms = @divFloor(now - self.last_ffm_time, std.time.ns_per_ms);
@@ -528,6 +562,335 @@ pub const Daemon = struct {
         }
 
         return event;
+    }
+
+    /// Mouse drag callback for modifier+click window operations
+    fn mouseDragCallback(
+        proxy: c.c.CGEventTapProxy,
+        event_type: c.c.CGEventType,
+        event: c.c.CGEventRef,
+        user_info: ?*anyopaque,
+    ) callconv(.c) c.c.CGEventRef {
+        _ = proxy;
+        _ = user_info;
+
+        const self = instance orelse return event;
+
+        // Check if shutting down
+        if (self.shutting_down.load(.acquire)) return event;
+
+        // Re-enable tap if disabled
+        if (event_type == c.c.kCGEventTapDisabledByTimeout or
+            event_type == c.c.kCGEventTapDisabledByUserInput)
+        {
+            if (!self.mouse_drag_tap.isEnabled()) {
+                self.mouse_drag_tap.reenable();
+            }
+            return event;
+        }
+
+        // Get modifier flags
+        const flags = c.c.CGEventGetFlags(event);
+        const modifier = Mouse.Modifier.fromCGFlags(flags);
+
+        // Check if our configured modifier is held
+        const config_modifier: Mouse.Modifier = switch (self.config.mouse_modifier) {
+            .fn_key => .fn_key,
+            .shift => .shift,
+            .ctrl => .ctrl,
+            .alt => .alt,
+            .cmd => .cmd,
+        };
+
+        const modifier_held = (modifier == config_modifier);
+
+        // Handle events based on type
+        switch (event_type) {
+            c.c.kCGEventLeftMouseDown, c.c.kCGEventRightMouseDown => {
+                if (!modifier_held) {
+                    // Modifier not held, reset state if any
+                    self.mouse_state.reset();
+                    return event;
+                }
+
+                // Start drag operation
+                var point = c.c.CGEventGetLocation(event);
+                const cursor_point = geometry.Point{
+                    .x = point.x,
+                    .y = point.y,
+                };
+
+                // Find window under cursor
+                var window_point: c.CGPoint = undefined;
+                var window_id: u32 = 0;
+                var window_cid: c_int = 0;
+
+                _ = self.skylight.SLSFindWindowAndOwner(
+                    self.connection,
+                    0,
+                    1,
+                    0,
+                    &point,
+                    &window_point,
+                    &window_id,
+                    &window_cid,
+                );
+
+                // Skip our own windows (feedback overlay)
+                if (window_cid == self.connection) {
+                    _ = self.skylight.SLSFindWindowAndOwner(
+                        self.connection,
+                        @intCast(window_id),
+                        -1,
+                        0,
+                        &point,
+                        &window_point,
+                        &window_id,
+                        &window_cid,
+                    );
+                }
+
+                if (window_id == 0) return event;
+
+                // Check if it's a tracked window
+                if (self.windows.getWindow(window_id) == null) return event;
+
+                // Store drag state
+                self.mouse_state.window_id = window_id;
+                self.mouse_state.down_location = cursor_point;
+                self.mouse_state.consume_click = true;
+
+                // Determine action based on button
+                const is_left = (event_type == c.c.kCGEventLeftMouseDown);
+                self.mouse_state.current_action = if (is_left)
+                    switch (self.config.mouse_action1) {
+                        .move => .move,
+                        .resize => .resize,
+                    }
+                else switch (self.config.mouse_action2) {
+                    .move => .move,
+                    .resize => .resize,
+                };
+
+                // Get original window frame
+                var bounds: c.CGRect = undefined;
+                if (self.skylight.SLSGetWindowBounds(self.connection, window_id, &bounds) == 0) {
+                    self.mouse_state.original_frame = .{
+                        .x = bounds.origin.x,
+                        .y = bounds.origin.y,
+                        .width = bounds.size.width,
+                        .height = bounds.size.height,
+                    };
+                }
+
+                // Determine resize direction if resizing
+                if (self.mouse_state.current_action == .resize) {
+                    self.mouse_state.determineResizeDirection(cursor_point, self.mouse_state.original_frame);
+                }
+
+                log.debug("drag: started wid={} action={}", .{ window_id, self.mouse_state.current_action });
+
+                // Consume the event (don't pass to app)
+                return null;
+            },
+
+            c.c.kCGEventLeftMouseDragged, c.c.kCGEventRightMouseDragged => {
+                // Only process if we're in a drag operation
+                if (self.mouse_state.window_id == null) return event;
+                if (self.mouse_state.current_action == .none) return event;
+
+                self.mouse_state.drag_detected = true;
+
+                var point = c.c.CGEventGetLocation(event);
+                const cursor_point = geometry.Point{ .x = point.x, .y = point.y };
+
+                // Find window under cursor (for drop target)
+                var window_point: c.CGPoint = undefined;
+                var target_window_id: u32 = 0;
+                var target_cid: c_int = 0;
+
+                _ = self.skylight.SLSFindWindowAndOwner(
+                    self.connection,
+                    0,
+                    1,
+                    0,
+                    &point,
+                    &window_point,
+                    &target_window_id,
+                    &target_cid,
+                );
+
+                // Skip our windows and the dragged window itself
+                const dragged_wid = self.mouse_state.window_id.?;
+                if (target_cid == self.connection or target_window_id == dragged_wid) {
+                    _ = self.skylight.SLSFindWindowAndOwner(
+                        self.connection,
+                        @intCast(target_window_id),
+                        -1,
+                        0,
+                        &point,
+                        &window_point,
+                        &target_window_id,
+                        &target_cid,
+                    );
+                }
+
+                // If move mode and we have a target, show feedback
+                if (self.mouse_state.current_action == .move and target_window_id != 0 and target_window_id != dragged_wid) {
+                    // Check if target is tracked
+                    if (self.windows.getWindow(target_window_id)) |_| {
+                        var target_bounds: c.CGRect = undefined;
+                        if (self.skylight.SLSGetWindowBounds(self.connection, target_window_id, &target_bounds) == 0) {
+                            const target_frame = geometry.Rect{
+                                .x = target_bounds.origin.x,
+                                .y = target_bounds.origin.y,
+                                .width = target_bounds.size.width,
+                                .height = target_bounds.size.height,
+                            };
+
+                            // Determine drop action
+                            self.mouse_state.current_drop_action = Mouse.determineDropAction(&self.mouse_state, target_frame, cursor_point);
+                            self.mouse_state.target_window_id = target_window_id;
+
+                            // Update feedback display
+                            self.mouse_state.updateFeedback(target_frame);
+                        }
+                    }
+                } else {
+                    // No valid target - hide feedback
+                    self.mouse_state.current_drop_action = .none;
+                    self.mouse_state.target_window_id = null;
+                    if (self.mouse_state.feedback) |*fb| {
+                        fb.hide();
+                    }
+                }
+
+                return null; // Consume event
+            },
+
+            c.c.kCGEventLeftMouseUp, c.c.kCGEventRightMouseUp => {
+                // Only process if we were tracking a drag
+                if (self.mouse_state.window_id == null) return event;
+
+                const dragged_wid = self.mouse_state.window_id.?;
+                const action = self.mouse_state.current_drop_action;
+                const target_wid = self.mouse_state.target_window_id;
+
+                // Hide feedback
+                if (self.mouse_state.feedback) |*fb| {
+                    fb.hide();
+                }
+
+                // Execute drop action if we have one
+                if (self.mouse_state.drag_detected and action != .none and target_wid != null) {
+                    log.info("drag: drop wid={} onto wid={} action={}", .{ dragged_wid, target_wid.?, action });
+
+                    // TODO: Execute the actual warp/swap/stack operation
+                    // This will require integration with the BSP tree in Spaces
+                    self.executeDragDrop(dragged_wid, target_wid.?, action);
+                }
+
+                // Reset state
+                self.mouse_state.reset();
+
+                return null; // Consume event
+            },
+
+            else => return event,
+        }
+    }
+
+    /// Execute a drag-drop operation (warp, swap, or stack)
+    fn executeDragDrop(self: *Self, source_wid: Window.Id, target_wid: Window.Id, action: Mouse.DropAction) void {
+        if (source_wid == target_wid) return;
+
+        // Get space_id from source window
+        const source_info = self.windows.getWindow(source_wid) orelse return;
+        const space_id = source_info.space_id;
+
+        switch (action) {
+            .swap => {
+                log.info("drag: swap {} <-> {}", .{ source_wid, target_wid });
+                self.windows.swapWindowOrder(source_wid, target_wid);
+            },
+            .stack => {
+                // Stack is not yet implemented - for now treat as swap
+                log.info("drag: stack {} onto {} (treating as swap)", .{ source_wid, target_wid });
+                self.windows.swapWindowOrder(source_wid, target_wid);
+            },
+            .warp_left, .warp_top => {
+                // Insert source BEFORE target
+                log.info("drag: warp {} before {}", .{ source_wid, target_wid });
+                self.windows.warpWindowOrder(source_wid, target_wid, false);
+            },
+            .warp_right, .warp_bottom => {
+                // Insert source AFTER target
+                log.info("drag: warp {} after {}", .{ source_wid, target_wid });
+                self.windows.warpWindowOrder(source_wid, target_wid, true);
+            },
+            .none => return,
+        }
+
+        // Apply layout to reflect the change
+        self.applyLayoutToSpace(space_id);
+    }
+
+    /// Calculate feedback overlay frame based on drop action
+    fn calculateFeedbackFrame(_: *Self, target_frame: geometry.Rect, action: Mouse.DropAction) geometry.Rect {
+        return switch (action) {
+            .stack, .swap => target_frame, // Full frame for center drop
+            .warp_left => .{
+                .x = target_frame.x,
+                .y = target_frame.y,
+                .width = target_frame.width / 2,
+                .height = target_frame.height,
+            },
+            .warp_right => .{
+                .x = target_frame.x + target_frame.width / 2,
+                .y = target_frame.y,
+                .width = target_frame.width / 2,
+                .height = target_frame.height,
+            },
+            .warp_top => .{
+                .x = target_frame.x,
+                .y = target_frame.y,
+                .width = target_frame.width,
+                .height = target_frame.height / 2,
+            },
+            .warp_bottom => .{
+                .x = target_frame.x,
+                .y = target_frame.y + target_frame.height / 2,
+                .width = target_frame.width,
+                .height = target_frame.height / 2,
+            },
+            .none => target_frame,
+        };
+    }
+
+    /// Finalize a drag-drop operation (called when window stops moving)
+    fn finalizeDragDrop(self: *Self) void {
+        const source_wid = self.dragging_window_id orelse return;
+        const target_wid = self.drag_target_wid orelse {
+            self.resetDragState();
+            return;
+        };
+        const action = self.drag_drop_action;
+
+        if (action != .none) {
+            self.executeDragDrop(source_wid, target_wid, action);
+        }
+
+        self.resetDragState();
+    }
+
+    /// Reset drag state
+    fn resetDragState(self: *Self) void {
+        self.dragging_window_id = null;
+        self.drag_target_wid = null;
+        self.drag_drop_action = .none;
+        if (self.insert_feedback) |*fb| {
+            fb.hide();
+        }
     }
 
     /// Focus window without raising it (for autofocus mode)
@@ -873,6 +1236,12 @@ pub const Daemon = struct {
             }
         }
 
+        // Special case: debug commands for testing
+        if (std.mem.eql(u8, domain, "debug")) {
+            self.handleDebugCommand(client_fd, args_data[domain.len + 1 ..]);
+            return;
+        }
+
         // Parse using typed Message system
         const Message = @import("ipc/Message.zig");
         const CommandHandler = @import("ipc/CommandHandler.zig");
@@ -945,6 +1314,102 @@ pub const Daemon = struct {
             .windows = &self.windows,
             .spaces = &self.spaces,
         }, client_fd, args);
+    }
+
+    /// Handle debug commands for testing
+    fn handleDebugCommand(self: *Self, client_fd: std.posix.socket_t, args: []const u8) void {
+        const cmd = std.mem.sliceTo(args, 0);
+
+        if (std.mem.eql(u8, cmd, "simulate-drag")) {
+            // Usage: debug simulate-drag <source_wid> <target_wid> <action>
+            // action: swap, warp_left, warp_right, warp_top, warp_bottom
+            var rest = args[cmd.len + 1 ..];
+            const src_str = std.mem.sliceTo(rest, 0);
+            rest = rest[src_str.len + 1 ..];
+            const dst_str = std.mem.sliceTo(rest, 0);
+            rest = rest[dst_str.len + 1 ..];
+            const action_str = std.mem.sliceTo(rest, 0);
+
+            const src_wid = std.fmt.parseInt(u32, src_str, 10) catch {
+                Server.sendErr(client_fd, Response.errWithDetail(.invalid_argument, "invalid source wid"));
+                return;
+            };
+            const dst_wid = std.fmt.parseInt(u32, dst_str, 10) catch {
+                Server.sendErr(client_fd, Response.errWithDetail(.invalid_argument, "invalid target wid"));
+                return;
+            };
+
+            const action: Mouse.DropAction = if (std.mem.eql(u8, action_str, "swap"))
+                .swap
+            else if (std.mem.eql(u8, action_str, "warp_left"))
+                .warp_left
+            else if (std.mem.eql(u8, action_str, "warp_right"))
+                .warp_right
+            else if (std.mem.eql(u8, action_str, "warp_top"))
+                .warp_top
+            else if (std.mem.eql(u8, action_str, "warp_bottom"))
+                .warp_bottom
+            else {
+                Server.sendErr(client_fd, Response.errWithDetail(.invalid_argument, "invalid action"));
+                return;
+            };
+
+            log.info("debug: simulate-drag src={d} dst={d} action={s}", .{ src_wid, dst_wid, action_str });
+
+            // Show feedback overlay on target (use SkyLight directly, don't require managed)
+            var target_bounds: c.CGRect = undefined;
+            if (self.skylight.SLSGetWindowBounds(self.connection, dst_wid, &target_bounds) == 0) {
+                const target_frame = geometry.Rect{
+                    .x = target_bounds.origin.x,
+                    .y = target_bounds.origin.y,
+                    .width = target_bounds.size.width,
+                    .height = target_bounds.size.height,
+                };
+
+                if (self.insert_feedback == null) {
+                    self.insert_feedback = InsertFeedback.init(self.connection);
+                }
+                if (self.insert_feedback) |*fb| {
+                    const feedback_frame = self.calculateFeedbackFrame(target_frame, action);
+                    fb.update(feedback_frame, self.config.insert_feedback_color);
+                    log.info("debug: showing feedback at ({d},{d} {d}x{d})", .{
+                        feedback_frame.x, feedback_frame.y, feedback_frame.width, feedback_frame.height,
+                    });
+                } else {
+                    log.err("debug: insert_feedback is null after init", .{});
+                    Server.sendErr(client_fd, Response.errWithDetail(.unknown_command, "failed to init feedback"));
+                    return;
+                }
+            } else {
+                log.err("debug: failed to get bounds for wid={d}", .{dst_wid});
+                Server.sendErr(client_fd, Response.errWithDetail(.invalid_argument, "failed to get window bounds"));
+                return;
+            }
+
+            // Set state for finalization
+            self.dragging_window_id = src_wid;
+            self.drag_target_wid = dst_wid;
+            self.drag_drop_action = action;
+
+            Server.sendResponse(client_fd, "ok - feedback shown, use 'debug finalize-drag' to execute");
+            return;
+        }
+
+        if (std.mem.eql(u8, cmd, "finalize-drag")) {
+            log.info("debug: finalize-drag", .{});
+            self.finalizeDragDrop();
+            Server.sendResponse(client_fd, "ok - drag finalized");
+            return;
+        }
+
+        if (std.mem.eql(u8, cmd, "cancel-drag")) {
+            log.info("debug: cancel-drag", .{});
+            self.resetDragState();
+            Server.sendResponse(client_fd, "ok - drag cancelled");
+            return;
+        }
+
+        Server.sendErr(client_fd, Response.errWithDetail(.unknown_command, "unknown debug command"));
     }
 
     // ============================================================================
@@ -1238,6 +1703,15 @@ pub const Daemon = struct {
     /// Process accumulated dirty state - called once per loop tick
     /// Order matters: validate -> sync -> process events -> layout
     fn processDirtyState(self: *Self) void {
+        // Check if a drag operation has ended (no window_moved for 100ms)
+        if (self.dragging_window_id != null) {
+            const now = std.time.nanoTimestamp();
+            const elapsed_ms = @divFloor(now - self.last_window_moved_time, std.time.ns_per_ms);
+            if (elapsed_ms >= 100) {
+                self.finalizeDragDrop();
+            }
+        }
+
         // Check for debounced display change first (highest priority)
         if (self.display_change_pending.load(.acquire)) {
             const change_time = self.display_change_time.load(.acquire);
@@ -2750,6 +3224,8 @@ pub const Daemon = struct {
         defer c.c.CFRelease(destroyed);
         const focus_changed = ax.createCFString(ax.Notification.focused_window_changed);
         defer c.c.CFRelease(focus_changed);
+        const window_moved = ax.createCFString(ax.Notification.window_moved);
+        defer c.c.CFRelease(window_moved);
 
         if (c.c.CFStringCompare(notification, created, 0) == c.c.kCFCompareEqualTo) {
             // Window created - apply rules and add to layout
@@ -2915,6 +3391,92 @@ pub const Daemon = struct {
             if (self.config.mouse_follows_focus) {
                 self.warpMouseToWindow(wid);
                 log.debug("focus changed: wid={d} (mouse warped)", .{wid});
+            }
+        } else if (c.c.CFStringCompare(notification, window_moved, 0) == c.c.kCFCompareEqualTo) {
+            // Window moved - handle insert feedback for drag/drop
+            const wid = Application.getWindowId(element) orelse return;
+
+            // Only handle managed windows
+            if (self.windows.getWindow(wid) == null) {
+                log.debug("window_moved: wid={d} not managed, ignoring", .{wid});
+                return;
+            }
+
+            log.debug("window_moved: wid={d} (managed)", .{wid});
+
+            // Track that this window is being dragged and update timestamp
+            self.dragging_window_id = wid;
+            self.last_window_moved_time = @truncate(std.time.nanoTimestamp());
+
+            // Get cursor position
+            var cursor: c.CGPoint = undefined;
+            if (self.skylight.SLSGetCurrentCursorLocation(self.connection, &cursor) != 0) return;
+
+            // Find window under cursor (excluding the dragged window and our overlays)
+            var window_point: c.CGPoint = undefined;
+            var target_wid: u32 = 0;
+            var target_cid: c_int = 0;
+
+            _ = self.skylight.SLSFindWindowAndOwner(
+                self.connection,
+                0,
+                1,
+                0,
+                &cursor,
+                &window_point,
+                &target_wid,
+                &target_cid,
+            );
+
+            // Skip our windows and the dragged window
+            while (target_wid != 0 and (target_cid == self.connection or target_wid == wid)) {
+                _ = self.skylight.SLSFindWindowAndOwner(
+                    self.connection,
+                    @intCast(target_wid),
+                    -1,
+                    0,
+                    &cursor,
+                    &window_point,
+                    &target_wid,
+                    &target_cid,
+                );
+            }
+
+            // Check if target is a managed window
+            if (target_wid != 0 and self.windows.getWindow(target_wid) != null) {
+                // Get target window frame
+                var target_bounds: c.CGRect = undefined;
+                if (self.skylight.SLSGetWindowBounds(self.connection, target_wid, &target_bounds) == 0) {
+                    const target_frame = geometry.Rect{
+                        .x = target_bounds.origin.x,
+                        .y = target_bounds.origin.y,
+                        .width = target_bounds.size.width,
+                        .height = target_bounds.size.height,
+                    };
+                    const cursor_point = geometry.Point{ .x = cursor.x, .y = cursor.y };
+
+                    // Determine drop action based on cursor position
+                    const drop_action = Mouse.determineDropAction(&self.mouse_state, target_frame, cursor_point);
+
+                    self.drag_target_wid = target_wid;
+                    self.drag_drop_action = drop_action;
+
+                    // Show feedback overlay
+                    if (self.insert_feedback == null) {
+                        self.insert_feedback = InsertFeedback.init(self.connection);
+                    }
+                    if (self.insert_feedback) |*fb| {
+                        const feedback_frame = self.calculateFeedbackFrame(target_frame, drop_action);
+                        fb.update(feedback_frame, self.config.insert_feedback_color);
+                    }
+                }
+            } else {
+                // No valid target - hide feedback
+                self.drag_target_wid = null;
+                self.drag_drop_action = .none;
+                if (self.insert_feedback) |*fb| {
+                    fb.hide();
+                }
             }
         }
     }

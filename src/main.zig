@@ -266,12 +266,13 @@ pub fn main() !u8 {
         return sendMessage(allocator, args[2..]);
     }
 
-    // Direct domain commands: space, window, display, query, config
+    // Direct domain commands: space, window, display, query, config, debug
     if (std.mem.eql(u8, opt, "space") or
         std.mem.eql(u8, opt, "window") or
         std.mem.eql(u8, opt, "display") or
         std.mem.eql(u8, opt, "query") or
-        std.mem.eql(u8, opt, "config"))
+        std.mem.eql(u8, opt, "config") or
+        std.mem.eql(u8, opt, "debug"))
     {
         return sendMessage(allocator, args[1..]);
     }
@@ -1316,6 +1317,9 @@ fn startDaemon(skip_checks: bool) u8 {
 
     // Start tracking running applications for auto-tiling (after config loaded)
     daemon.startApplicationTracking();
+
+    // Start mouse drag tap for modifier+click window operations
+    daemon.startMouseDragTap();
 
     if (g.record_path != null) {
         log.info("yabai.zig {s} started (recording to {s})", .{ Version.string(), g.record_path.? });

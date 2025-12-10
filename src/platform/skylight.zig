@@ -3,6 +3,7 @@ const c = @import("c.zig");
 const macho = @import("../sa/macho.zig");
 
 const SKYLIGHT_PATH = "/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight";
+const COREGRAPHICS_PATH = "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics";
 
 pub const ConnectionCallback = *const fn (
     event_type: u32,
@@ -14,6 +15,12 @@ pub const ConnectionCallback = *const fn (
 
 fn lookup(comptime T: type, comptime symbol: [:0]const u8) ?T {
     return macho.findSymbol(T, SKYLIGHT_PATH, symbol);
+}
+
+fn lookupCG(comptime T: type, comptime symbol: [:0]const u8) ?T {
+    // Try SkyLight first, then CoreGraphics
+    return macho.findSymbol(T, SKYLIGHT_PATH, symbol) orelse
+        macho.findSymbol(T, COREGRAPHICS_PATH, symbol);
 }
 
 pub const SkyLight = struct {
@@ -56,6 +63,7 @@ pub const SkyLight = struct {
     SLSNewWindowWithOpaqueShapeAndContext: *const fn (c_int, c_int, c.CFTypeRef, c.CFTypeRef, c_int, *u64, f32, f32, c_int, *u32, ?*anyopaque) callconv(.c) c.CGError,
     SLSReleaseWindow: *const fn (c_int, u32) callconv(.c) c.CGError,
     SLSSetWindowShape: *const fn (c_int, u32, f32, f32, c.CFTypeRef) callconv(.c) c.CGError,
+    CGSNewRegionWithRect: *const fn (*const c.CGRect, *c.CFTypeRef) callconv(.c) c.CGError,
 
     // Window ownership
     SLSGetWindowOwner: *const fn (c_int, u32, *c_int) callconv(.c) c.CGError,
@@ -173,6 +181,7 @@ pub const SkyLight = struct {
             .SLSNewWindowWithOpaqueShapeAndContext = lookup(@TypeOf(@as(SkyLight, undefined).SLSNewWindowWithOpaqueShapeAndContext), "_SLSNewWindowWithOpaqueShapeAndContext") orelse return error.SymbolNotFound,
             .SLSReleaseWindow = lookup(@TypeOf(@as(SkyLight, undefined).SLSReleaseWindow), "_SLSReleaseWindow") orelse return error.SymbolNotFound,
             .SLSSetWindowShape = lookup(@TypeOf(@as(SkyLight, undefined).SLSSetWindowShape), "_SLSSetWindowShape") orelse return error.SymbolNotFound,
+            .CGSNewRegionWithRect = lookupCG(@TypeOf(@as(SkyLight, undefined).CGSNewRegionWithRect), "_CGSNewRegionWithRect") orelse return error.SymbolNotFound,
 
             // Window ownership
             .SLSGetWindowOwner = lookup(@TypeOf(@as(SkyLight, undefined).SLSGetWindowOwner), "_SLSGetWindowOwner") orelse return error.SymbolNotFound,

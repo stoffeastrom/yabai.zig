@@ -181,6 +181,11 @@ pub fn swapWindowOrder(self: *Windows, wid_a: Window.Id, wid_b: Window.Id) void 
     self._table.swapWindowOrder(wid_a, wid_b);
 }
 
+/// Warp (move) source window to be adjacent to target window
+pub fn warpWindowOrder(self: *Windows, source_wid: Window.Id, target_wid: Window.Id, insert_after: bool) void {
+    self._table.warpWindowOrder(source_wid, target_wid, insert_after);
+}
+
 /// Get all window IDs (allocates)
 pub fn getWindowIds(self: *Windows, allocator: std.mem.Allocator) ![]Window.Id {
     var list = std.ArrayList(Window.Id).init(allocator);

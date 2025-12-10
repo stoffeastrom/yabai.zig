@@ -6,6 +6,7 @@ const c = @import("../platform/c.zig");
 const geometry = @import("../core/geometry.zig");
 const Window = @import("../core/Window.zig");
 const View = @import("../core/View.zig");
+const InsertFeedback = @import("InsertFeedback.zig").InsertFeedback;
 
 const Point = geometry.Point;
 const Rect = geometry.Rect;
@@ -115,16 +116,90 @@ pub const State = struct {
     ffm_window_id: ?Window.Id = null,
     /// Resize direction
     direction: u8 = 0,
+    /// Target window for drop (the window under cursor during drag)
+    target_window_id: ?Window.Id = null,
+    /// Current drop action determined during drag
+    current_drop_action: DropAction = .none,
+    /// Visual feedback overlay for insertion point
+    feedback: ?InsertFeedback = null,
+    /// Feedback color (ARGB)
+    feedback_color: u32 = 0xffd75f5f,
 
     pub fn init() State {
         return .{};
     }
 
+    /// Initialize with SkyLight connection for feedback windows
+    pub fn initWithConnection(connection: c_int) State {
+        return .{
+            .feedback = InsertFeedback.init(connection),
+        };
+    }
+
     pub fn reset(self: *State) void {
+        // Hide feedback before reset
+        if (self.feedback) |*fb| {
+            fb.hide();
+        }
         self.current_action = .none;
         self.consume_click = false;
         self.drag_detected = false;
         self.window_id = null;
+        self.target_window_id = null;
+        self.current_drop_action = .none;
+    }
+
+    /// Deinitialize feedback resources
+    pub fn deinit(self: *State) void {
+        if (self.feedback) |*fb| {
+            fb.deinit();
+        }
+    }
+
+    /// Update feedback display based on current drag state
+    pub fn updateFeedback(self: *State, target_frame: ?Rect) void {
+        const fb = &(self.feedback orelse return);
+
+        if (self.current_drop_action == .none or target_frame == null) {
+            fb.hide();
+            return;
+        }
+
+        // Calculate feedback rect based on drop action
+        const frame = target_frame.?;
+        const feedback_frame: Rect = switch (self.current_drop_action) {
+            .stack, .swap => frame, // Full frame for center drop
+            .warp_left => .{
+                .x = frame.x,
+                .y = frame.y,
+                .width = frame.width / 2,
+                .height = frame.height,
+            },
+            .warp_right => .{
+                .x = frame.x + frame.width / 2,
+                .y = frame.y,
+                .width = frame.width / 2,
+                .height = frame.height,
+            },
+            .warp_top => .{
+                .x = frame.x,
+                .y = frame.y,
+                .width = frame.width,
+                .height = frame.height / 2,
+            },
+            .warp_bottom => .{
+                .x = frame.x,
+                .y = frame.y + frame.height / 2,
+                .width = frame.width,
+                .height = frame.height / 2,
+            },
+            .none => {
+                fb.hide();
+                return;
+            },
+        };
+
+        fb.update(feedback_frame, self.feedback_color);
     }
 
     /// Determine the resize direction based on click position within window

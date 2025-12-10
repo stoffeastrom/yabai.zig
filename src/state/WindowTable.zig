@@ -326,6 +326,62 @@ pub fn swapWindowOrder(self: *WindowTable, wid_a: Window.Id, wid_b: Window.Id) v
     }
 }
 
+/// Warp (move) source window to be adjacent to target window
+/// If insert_after is true, source is placed after target; otherwise before.
+pub fn warpWindowOrder(self: *WindowTable, source_wid: Window.Id, target_wid: Window.Id, insert_after: bool) void {
+    if (source_wid == target_wid) return;
+
+    const entry_src = self.entries.get(source_wid) orelse return;
+    const entry_tgt = self.entries.get(target_wid) orelse return;
+
+    // Only warp if on same space
+    if (entry_src.space_id != entry_tgt.space_id) return;
+
+    const list = self.by_space.getPtr(entry_src.space_id) orelse return;
+
+    // Find positions
+    var src_idx: ?usize = null;
+    var tgt_idx: ?usize = null;
+
+    for (list.items[0..list.len], 0..) |wid, i| {
+        if (wid == source_wid) src_idx = i;
+        if (wid == target_wid) tgt_idx = i;
+    }
+
+    const si = src_idx orelse return;
+    const ti = tgt_idx orelse return;
+
+    // Remove source from its position
+    for (si..list.len - 1) |j| {
+        list.items[j] = list.items[j + 1];
+    }
+    list.len -= 1;
+
+    // Adjust target index if source was before target
+    const insert_idx = blk: {
+        var adj_ti = ti;
+        if (si < ti) adj_ti -= 1;
+        break :blk if (insert_after) adj_ti + 1 else adj_ti;
+    };
+
+    // Insert source at new position
+    if (insert_idx >= list.len) {
+        // Append at end
+        list.items[list.len] = source_wid;
+        list.len += 1;
+    } else {
+        // Shift items and insert
+        var j: usize = list.len;
+        while (j > insert_idx) : (j -= 1) {
+            list.items[j] = list.items[j - 1];
+        }
+        list.items[insert_idx] = source_wid;
+        list.len += 1;
+    }
+
+    log.debug("warpWindowOrder: moved {d} {s} {d}", .{ source_wid, if (insert_after) "after" else "before", target_wid });
+}
+
 /// Iterator over all entries
 pub fn iterator(self: *WindowTable) std.AutoHashMapUnmanaged(Window.Id, Entry).Iterator {
     return self.entries.iterator();
